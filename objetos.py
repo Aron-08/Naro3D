@@ -38,10 +38,12 @@ import json
 import os
 import time
 
-import ia_interprete as ia  # reutiliza _llamar_modelo / _extraer_json / el modelo configurado
+import ia_interprete as ia  # reutiliza _extraer_json / catálogo (las llamadas al modelo pasan por modelos.py)
+import modelos              # modelo/temperatura de cada skill vienen de modelos_config.json
 import geometria as geo     # auditoría topológica (skill 02) antes de guardar/dibujar cualquier figura
 import termodinamica as term  # análisis térmico bajo demanda (skill 04) sobre un objeto ya creado
 import calculo_estructural as est  # tensión/FS/deflexión bajo demanda (skill 05) sobre un objeto ya creado
+import electrico as elec    # ley de Ohm / red de componentes bajo demanda (skill 06)
 
 
 # ---------------------------------------------------------------------------
@@ -320,13 +322,12 @@ def generar_propiedades(descripcion: str) -> dict | None:
     """Le pide al modelo una ficha de propiedades físicas completa para `descripcion`.
     No toca la geometría: se usa como paso 2, después de que la figura ya existe."""
     print(f"[objetos] Generando propiedades físicas para '{descripcion}'...")
-    contenido = ia._llamar_modelo(
+    contenido = modelos.llamar(
+        "propiedades_fisicas_basicas",
         messages=[
             {"role": "system", "content": SYSTEM_PROPIEDADES_FISICAS},
             {"role": "user", "content": descripcion},
         ],
-        num_predict=-1,
-        temperatura=0.2,
     )
     datos = ia._extraer_json(contenido)
     if not datos:
@@ -346,13 +347,12 @@ def actualizar_propiedades(propiedades: dict, pedido: str) -> dict | None:
         f"Ficha actual:\n{json.dumps(actuales, ensure_ascii=False)}\n\n"
         f"Pedido del usuario: {pedido}"
     )
-    contenido = ia._llamar_modelo(
+    contenido = modelos.llamar(
+        "propiedades_fisicas_actualizar",
         messages=[
             {"role": "system", "content": SYSTEM_ACTUALIZAR_PROPIEDADES},
             {"role": "user", "content": contenido_usuario},
         ],
-        num_predict=-1,
-        temperatura=0.2,
     )
     datos = ia._extraer_json(contenido)
     if not datos:
@@ -367,13 +367,66 @@ def actualizar_propiedades(propiedades: dict, pedido: str) -> dict | None:
 # Ficha extendida de materiales (skill 03_ciencia_materiales)
 # ---------------------------------------------------------------------------
 
+try:
+    from pydantic import BaseModel, ConfigDict, field_validator
+    _PYDANTIC_DISPONIBLE = True
+except ImportError:
+    _PYDANTIC_DISPONIBLE = False
+    print("[objetos] pydantic no está instalado; la skill 'materiales' (JSON nativo de "
+          "Ollama) usa solo el clamp físico de validar_y_corregir_material, sin la capa "
+          "extra de tipado estricto. Para activarla: pip install pydantic --break-system-packages")
+
+
+if _PYDANTIC_DISPONIBLE:
+    class _FichaMaterialExtendidaPydantic(BaseModel):
+        """Esquema estricto para la salida JSON (format=\"json\") de la skill 03
+        (ciencia de materiales). NO reemplaza validar_y_corregir_material —
+        esa sigue siendo la única fuente de verdad de rangos físicos. Esto
+        solo garantiza tipo/forma antes de que los números lleguen ahí, para
+        que un campo con basura (string donde va un número, NaN, un objeto
+        anidado) se descarte acá en vez de colarse como 0.0 silencioso."""
+        model_config = ConfigDict(extra="ignore")
+
+        coef_dilatacion_termica_1_k: float | None = None
+        calor_especifico_j_kgk: float | None = None
+        modulo_poisson: float | None = None
+        limite_fatiga_mpa: float | None = None
+        temperatura_max_servicio_c: float | None = None
+
+        @field_validator("*", mode="before")
+        @classmethod
+        def _vacio_a_none(cls, v):
+            # El modelo local a veces manda "" o "null" como texto en vez de
+            # omitir la clave directamente; tratarlo como ausente en vez de
+            # dejar que el cast a float tire una excepción más abajo.
+            if isinstance(v, str) and v.strip().lower() in ("", "null", "none", "nan"):
+                return None
+            return v
+
+
 def _normalizar_propiedades_extendidas(datos: dict) -> dict:
     """Mismo criterio que _normalizar_propiedades: completa claves faltantes
     y fuerza tipos numéricos, para que una respuesta parcial o mal tipada del
-    modelo no rompa nada río abajo."""
+    modelo no rompa nada río abajo.
+
+    Si pydantic está disponible, primero pasa `datos` por
+    `_FichaMaterialExtendidaPydantic` (capa de tipado estricto de la skill
+    03) — cualquier campo que no castee limpio a float queda en None y cae
+    en la plantilla de seguridad de `validar_y_corregir_material`, en vez de
+    quedar como un 0.0 indistinguible de un valor real."""
     resultado = dict(_PROPIEDADES_EXTENDIDAS_VACIAS)
     if not isinstance(datos, dict):
         return resultado
+
+    if _PYDANTIC_DISPONIBLE:
+        try:
+            validado = _FichaMaterialExtendidaPydantic.model_validate(datos)
+            datos = validado.model_dump(exclude_none=True)
+        except Exception as e:
+            print(f"[objetos][ciencia_materiales] Ficha extendida no pasó el esquema Pydantic "
+                  f"({e}); se completa con la plantilla de seguridad.")
+            datos = {}
+
     for clave in _CLAVES_EXT:
         if clave not in datos:
             continue
@@ -454,13 +507,15 @@ def generar_propiedades_extendidas(nombre: str, propiedades_base: dict) -> dict:
         "resistencia_compresion_mpa": propiedades_base.get("resistencia_compresion_mpa", 0.0),
         "dureza": propiedades_base.get("dureza", ""),
     }
-    contenido = ia._llamar_modelo(
+    # Skill "materiales" en modelos_config.json (phi4-mini:3.8b + modo JSON
+    # nativo de Ollama): validar_y_corregir_material() de abajo es la capa 3
+    # (Pydantic/clamp) que exige el contrato de la skill 00.
+    contenido = modelos.llamar(
+        "materiales",
         messages=[
             {"role": "system", "content": SYSTEM_PROPIEDADES_EXTENDIDAS},
             {"role": "user", "content": json.dumps(contexto, ensure_ascii=False)},
         ],
-        num_predict=-1,
-        temperatura=0.15,
     )
     datos = ia._extraer_json(contenido)
     if not datos:
@@ -664,6 +719,49 @@ def evaluar_carga_objeto(nombre: str, carga: dict, escala_m_por_unidad: float,
 
     for aviso in resultado["advertencias"]:
         print(f"[objetos][calculo_estructural]{aviso}")
+
+    return resultado
+
+
+def evaluar_circuito_objeto(nombres: list[str], fuentes: list[dict],
+                             margen_contacto: float = 0.02) -> dict | None:
+    """Skill 06 (electrico.py) aplicada a un grupo de objetos YA creados y
+    colocados en la escena ("¿cuánta corriente pasa por cada cable si
+    conecto la pila acá?"). La topología sale de ubicacion.py (quién toca a
+    quién) — nunca se le pregunta al LLM ni a la mano qué está conectado con
+    qué, es geometría (regla 4 del filtro de ruido, igual criterio que
+    evaluar_carga_objeto/analizar_termico_objeto).
+
+    nombres: objetos a incluir en la red (deben existir y tener figura+propiedades).
+    fuentes: [{"nombre", "nodo_pos", "nodo_neg", "tension_v"}] — la polaridad de
+    una fuente no se puede inferir de la geometría, así que se pasa explícita;
+    nodo_pos/nodo_neg típicamente son terminales "<objeto>#A"/"<objeto>#B" de
+    electrico.construir_red_desde_contacto().
+
+    Devuelve el dict de electrico.evaluar_circuito(), o None si falta algún objeto.
+    """
+    import ubicacion as ubi
+
+    fichas = {}
+    for nombre in nombres:
+        registro = cargar_objeto(nombre)
+        if not registro or not registro.get("propiedades"):
+            print(f"[objetos] '{nombre}' no existe o le falta la ficha de propiedades; "
+                  f"no se puede evaluar el circuito.")
+            return None
+        fichas[nombre] = registro["propiedades"]
+
+    objetos_escena = [o for o in ubi.objetos_en_escena_actual() if o["nombre"] in fichas]
+    elementos, _mapa = elec.construir_red_desde_contacto(objetos_escena, fichas, margen_contacto)
+
+    try:
+        resultado = elec.evaluar_circuito(elementos, fuentes)
+    except Exception as e:
+        print(f"[objetos] No se pudo completar el análisis eléctrico: {e}")
+        return None
+
+    for aviso in resultado["advertencias"]:
+        print(f"[objetos][electrico]{aviso}")
 
     return resultado
 

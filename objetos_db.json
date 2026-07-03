@@ -1,0 +1,207 @@
+{
+  "oso": {
+    "nombre": "oso",
+    "figura": {
+      "puntos": [],
+      "conexiones": [],
+      "primitivas": [
+        {
+          "tipo": "circulo",
+          "cx": 0.5,
+          "cy": 0.61,
+          "r": 0.19000000000000003,
+          "cz": 0.5
+        }
+      ]
+    },
+    "propiedades": {
+      "material": "",
+      "peso_kg": 0.0,
+      "densidad_kg_m3": 0.0,
+      "resistencia_traccion_mpa": 0.0,
+      "resistencia_corte_mpa": 0.0,
+      "resistencia_compresion_mpa": 0.0,
+      "limite_elastico_mpa": 0.0,
+      "modulo_elasticidad_gpa": 0.0,
+      "dureza": "",
+      "resistencia_electrica_ohm_m": 0.0,
+      "conductividad_termica_w_mk": 0.0,
+      "punto_fusion_c": 0.0,
+      "coef_friccion": 0.0,
+      "notas": ""
+    },
+    "propiedades_extendidas": {},
+    "creado": "2026-07-02 15:52:19",
+    "actualizado": "2026-07-02 15:52:19"
+  },
+  "casa": {
+    "nombre": "casa",
+    "figura": {
+      "puntos": [],
+      "conexiones": [],
+      "primitivas": [
+        {
+          "tipo": "rectangulo",
+          "x": 0.25,
+          "y": 0.42,
+          "ancho": 0.5,
+          "alto": 0.2
+        },
+        {
+          "tipo": "cubo",
+          "cx": 0.25,
+          "cy": 0.42,
+          "cz": 0.5,
+          "ancho": 0.5,
+          "alto": 0.38,
+          "profundo": 0.5
+        },
+        {
+          "tipo": "cubo",
+          "cx": 0.25,
+          "cy": 0.2,
+          "cz": 0.5,
+          "ancho": 0.5,
+          "alto": 0.18,
+          "profundo": 0.5
+        }
+      ]
+    },
+    "propiedades": {
+      "material": "madera",
+      "peso_kg": 100.0,
+      "densidad_kg_m3": 500.0,
+      "resistencia_traccion_mpa": 2000000.0,
+      "resistencia_corte_mpa": 18000000.0,
+      "resistencia_compresion_mpa": 14000000.0,
+      "limite_elastico_mpa": 5000000000.0,
+      "modulo_elasticidad_gpa": 2000000.0,
+      "dureza": "120 HB",
+      "resistencia_electrica_ohm_m": 18000000.0,
+      "conductividad_termica_w_mk": 0.0015,
+      "punto_fusion_c": 260.0,
+      "coef_friccion": 0.4,
+      "notas": "estructura de madera, aislante térmico"
+    },
+    "propiedades_extendidas": {},
+    "creado": "2026-07-02 16:12:54",
+    "actualizado": "2026-07-02 20:54:14"
+  },
+  "persona": {
+    "nombre": "persona",
+    "figura": {
+      "puntos": [
+        [
+          0.5,
+          0.22
+        ]
+      ],
+      "conexiones": [],
+      "primitivas": [
+        {
+          "tipo": "circulo",
+          "cx": 0.39,
+          "cy": 0.31,
+          "r": 0.07
+        },
+        {
+          "tipo": "circulo",
+          "cx": 0.61,
+          "cy": 0.31,
+          "r": 0.07
+        },
+        {
+          "tipo": "rectangulo",
+          "x": 0.42,
+          "y": 0.22,
+          "ancho": 0.16,
+          "alto": 0.12
+        },
+        {
+          "tipo": "cubo",
+          "cx": 0.5,
+          "cy": 0.42,
+          "cz": 0.3,
+          "ancho": 0.4,
+          "alto": 0.36,
+          "profundo": 0.3
+        }
+      ]
+    },
+    "propiedades": {
+      "material": "hierro",
+      "peso_kg": 10.0,
+      "densidad_kg_m3": 7850.0,
+      "resistencia_traccion_mpa": 200000.0,
+      "resistencia_corte_mpa": 400000.0,
+      "resistencia_compresion_mpa": 1000000.0,
+      "limite_elastico_mpa": 5000000.0,
+      "modulo_elasticidad_gpa": 200000.0,
+      "dureza": "60 Shore A",
+      "resistencia_electrica_ohm_m": 1000000000.0,
+      "conductividad_termica_w_mk": 0.85,
+      "punto_fusion_c": 1538.0,
+      "coef_friccion": 0.2,
+      "notas": "hierro fundido, resistente a la corrosión y al fuego"
+    },
+    "propiedades_extendidas": {},
+    "creado": "2026-07-02 18:38:29",
+    "actualizado": "2026-07-02 18:39:00"
+  },
+  "casa de dos pisos con terraza": {
+    "nombre": "casa de dos pisos con terraza",
+    "figura": {
+      "puntos": [],
+      "conexiones": [],
+      "primitivas": [
+        {
+          "tipo": "circulo",
+          "cx": 0.5,
+          "cy": 0.2,
+          "r": 0.15,
+          "cz": 0.15
+        },
+        {
+          "tipo": "circulo",
+          "cx": 0.25,
+          "cy": 0.42,
+          "r": 0.15
+        },
+        {
+          "tipo": "circulo",
+          "cx": 0.75,
+          "cy": 0.42,
+          "r": 0.15
+        },
+        {
+          "tipo": "cubo",
+          "cx": 0.25,
+          "cy": 0.42,
+          "cz": 0.5,
+          "ancho": 0.5,
+          "alto": 0.38,
+          "profundo": 0.5
+        }
+      ]
+    },
+    "propiedades": {
+      "material": "concreto armado",
+      "peso_kg": 100.0,
+      "densidad_kg_m3": 2400.0,
+      "resistencia_traccion_mpa": 75000.0,
+      "resistencia_corte_mpa": 6000.0,
+      "resistencia_compresion_mpa": 18000.0,
+      "limite_elastico_mpa": 200000.0,
+      "modulo_elasticidad_gpa": 30.0,
+      "dureza": "concreto armado",
+      "resistencia_electrica_ohm_m": 1500000.0,
+      "conductividad_termica_w_mk": 0.8,
+      "punto_fusion_c": 947.0,
+      "coef_friccion": 0.3,
+      "notas": "estructura de hormigón armado, con vigas y pilares de concreto armado."
+    },
+    "propiedades_extendidas": {},
+    "creado": "2026-07-02 19:59:45",
+    "actualizado": "2026-07-02 20:00:16"
+  }
+}

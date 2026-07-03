@@ -195,6 +195,42 @@ PANEL_W, PANEL_H = 960, 720
 
 entorno = EntornoVirtual(PANEL_W, PANEL_H)
 
+# --- vision3d: head tracking + proyección fuera de eje + estéreo anaglifo ---
+# Ver vision3d.py para el detalle. calibracion_pantalla tiene valores por
+# defecto razonables pero conviene medir el setup real una vez (regla sobre
+# el monitor, offset de la webcam) — ver el docstring de CalibracionPantalla.
+# Cero costo si _modo_vision3d queda en None: renderizar_entorno() cae
+# directo a entorno.dibujar(panel), el camino de siempre.
+import vision3d
+
+calibracion_pantalla = vision3d.CalibracionPantalla(
+    ancho_cm=34.0, alto_cm=19.0,
+    offset_camara_y_cm=10.0,
+    fov_horizontal_deg=60.0,
+    distancia_default_cm=55.0,
+)
+rastreador_cabeza = vision3d.RastreadorCabeza(MP_ANCHO, MP_ALTO, calibracion_pantalla, cada_n_frames=2)
+motor_estereo = vision3d.MotorEstereo(calibracion_pantalla)
+_modo_vision3d = None   # None | vision3d.MODO_OFFAXIS | vision3d.MODO_ANAGLIFO
+cabeza_cm = None        # última posición conocida de la cabeza (cm, centrado en pantalla)
+
+
+def renderizar_entorno(panel):
+    """Reemplaza los call-sites directos de entorno.dibujar(panel): si no hay
+    ningún modo de vision3d activo, es exactamente lo de siempre (mismo
+    panel, mismo costo, dibuja in-place). Con un modo activo, motor_estereo
+    re-renderiza todo el frame en función de dónde está la cabeza y el
+    resultado se copia in-place sobre `panel` (panel[:] = resultado) — así
+    el call-site no necesita reasignar la variable, se comporta exactamente
+    como el entorno.dibujar(panel) que reemplaza."""
+    if _modo_vision3d is None:
+        entorno.dibujar(panel)
+        return panel
+    resultado = motor_estereo.renderizar(entorno, cabeza_cm, PANEL_W, PANEL_H, modo=_modo_vision3d)
+    panel[:] = resultado
+    return panel
+
+
 # Cola de figuras generadas por la IA, listas para agregar al entorno.
 # Solo se hace append() desde el hilo de tkinter y pop(0) desde el hilo de OpenCV;
 # la GIL de Python hace que ambas operaciones sean atómicas, así que no necesitamos un Lock.
@@ -709,7 +745,7 @@ def dibujar_panel(manos, debug=False):
 
     entorno.actualizar(todos_los_puntos)
     entorno.actualizar_gestos(info_gestos)
-    entorno.dibujar(panel)
+    renderizar_entorno(panel)
 
     for puntas_px, nudillos_px, intermedias_px, centro_px, estados, etiqueta, votos, _, __ in manos:
         for nudillo, intermedia, punta, nombre, extendido in zip(
@@ -808,6 +844,13 @@ while True:
     l_ch, a_ch, b_ch = cv2.split(lab)
     l_ch = _clahe.apply(l_ch)
     frame_mp = cv2.cvtColor(cv2.merge([l_ch, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
+
+    # Head tracking (vision3d): se corre sobre frame_mp SIN el padding que se
+    # agrega abajo para manos — la cara no lo necesita, y correrlo antes evita
+    # que el borde negro le reste resolución útil a la cara. cabeza_cm queda
+    # actualizado en la variable global que usa renderizar_entorno().
+    rgb_cara = cv2.cvtColor(frame_mp, cv2.COLOR_BGR2RGB)
+    cabeza_cm = rastreador_cabeza.procesar(rgb_cara)
 
     # Margen de detección: borde negro alrededor de la imagen de trabajo
     # (ver MARGEN_DETECCION más arriba) para que la mano nunca ocupe el
@@ -965,7 +1008,7 @@ while True:
     else:
         entorno.actualizar([])
         entorno.actualizar_gestos([])
-        entorno.dibujar(panel)
+        renderizar_entorno(panel)
         modo_txt = "[D] DEBUG ON  (D=off)" if _debug_votos else "[D] debug off (D=on)"
         cv2.putText(panel, modo_txt, (10, PANEL_H - 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
@@ -984,6 +1027,13 @@ while True:
     elif key == ord('d') or key == ord('D'):
         _debug_votos = not _debug_votos
         print(f"[debug] modo votos {'ON' if _debug_votos else 'OFF'}")
+    elif key == ord('e') or key == ord('E'):
+        _modo_vision3d = None if _modo_vision3d == vision3d.MODO_ANAGLIFO else vision3d.MODO_ANAGLIFO
+        print(f"[vision3d] modo anaglifo {'ON' if _modo_vision3d == vision3d.MODO_ANAGLIFO else 'OFF'}")
+    elif key == ord('p') or key == ord('P'):
+        _modo_vision3d = None if _modo_vision3d == vision3d.MODO_OFFAXIS else vision3d.MODO_OFFAXIS
+        print(f"[vision3d] modo off-axis {'ON' if _modo_vision3d == vision3d.MODO_OFFAXIS else 'OFF'}")
 
 captura_hilo.detener()
+rastreador_cabeza.cerrar()
 cv2.destroyAllWindows()

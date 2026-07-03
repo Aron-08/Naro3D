@@ -1,0 +1,149 @@
+{
+  "_leeme": [
+    "Cada bloque de 'skills' controla qué modelo de Ollama usa esa parte del pipeline.",
+    "Para cambiar un modelo (ej. porque pesa demasiado en alguna de las dos PCs),",
+    "editá el campo 'modelo' acá con el tag exacto que te devuelve `ollama list`.",
+    "No hace falta tocar ningún .py: modelos.py relee este archivo en cada llamada.",
+    "'temperatura_min'/'temperatura_max' son el rango dentro del cual se elige la",
+    "temperatura en cada llamada (mismo criterio que ya usabas: bajo para skills de",
+    "cálculo, más alto para razonamiento/descripción). 'num_predict': -1 = sin límite",
+    "de tokens de salida (igual que ya tenías en ia_interprete.py).",
+    "'formato': \"json\" activa el modo JSON nativo de Ollama (equivalente a mandar",
+    "format=\"json\" en la llamada); dejar null para las skills que usan el formato",
+    "de una línea por dato (P0:, CENTRO:, TIPO:, etc.).",
+    "'system': prompt del sistema que se inyecta automáticamente cuando se usa",
+    "modelos.llamar() con el parámetro 'user_content' (ver modelos.py)."
+  ],
+  "skills": {
+    "ubicacion_espacial": {
+      "modelo": "gemma4:e4b",
+      "temperatura_min": 0.1,
+      "temperatura_max": 0.2,
+      "num_predict": -1,
+      "formato": null,
+      "system": "Interpretás dónde debe ir un objeto nuevo dentro de una escena 3D, según lo que pidió el usuario. NO calculás coordenadas numéricas: solo identificás la intención.\n\nRecibís un JSON con:\n  - \"objeto_nuevo\": nombre del objeto a ubicar.\n  - \"objetos_en_escena\": lista de nombres de objetos ya presentes.\n  - \"pedido\": frase del usuario en lenguaje natural.\n\nRespondé ÚNICAMENTE con este formato, un dato por línea, sin texto adicional:\n\nREFERENCIA: <nombre_exacto_de_objetos_en_escena|piso|ninguno>\nREFERENCIA2: <nombre_exacto_de_objetos_en_escena|ninguno>\nRELACION: <al_lado|arriba|abajo|encima_tocando|debajo_tocando|entre|centro_escena>\nDIRECCION: <izquierda|derecha|frente|atras|ninguna>\nROT_Z: <grados, 0 si no se menciona orientación>\n\nReglas:\n  - REFERENCIA debe ser un nombre que aparece TEXTUAL en \"objetos_en_escena\", nunca inventado.\n    Si el pedido no menciona ningún objeto existente, usar REFERENCIA: ninguno.\n  - REFERENCIA2 solo se usa si RELACION es \"entre\" (ej. \"entre el bloque y la silla\").\n    En cualquier otro caso, REFERENCIA2: ninguno.\n  - \"encima_tocando\" es para cuando un objeto se apoya sobre otro (ej. \"arriba de la mesa,\n    apoyado\"). \"arriba\" sin más es una posición relativa sin contacto (más alto, separado).\n  - DIRECCION solo aplica a \"al_lado\" (izquierda/derecha) — para las demás relaciones usar \"ninguna\".\n  - Si el pedido no da información de rotación, ROT_Z: 0.\n\n=== EJEMPLOS ===\n\npedido: \"al lado del bloque de cemento, sin tocarlo\"\nREFERENCIA: Bloque de cemento\nREFERENCIA2: ninguno\nRELACION: al_lado\nDIRECCION: derecha\nROT_Z: 0\n\npedido: \"arriba de la mesa, apoyado sobre ella\"\nREFERENCIA: mesa\nREFERENCIA2: ninguno\nRELACION: encima_tocando\nDIRECCION: ninguna\nROT_Z: 0\n\npedido: \"entre el bloque de cemento y el cubo de plastico\"\nREFERENCIA: Bloque de cemento\nREFERENCIA2: cubo de plastico\nRELACION: entre\nDIRECCION: ninguna\nROT_Z: 0\n\npedido: \"en el centro, de canto\"\nREFERENCIA: ninguno\nREFERENCIA2: ninguno\nRELACION: centro_escena\nDIRECCION: ninguna\nROT_Z: 90",
+      "descripcion": "01_skill_ubicacion_espacial — decide dónde va cada objeto nuevo en la escena (CENTRO/APOYA/ROT_Z/MARGEN)",
+      "usado_en": "ubicacion.py :: _interpretar_pedido"
+    },
+    "geometria": {
+      "modelo": "qwen3:4b",
+      "temperatura_min": 0.1,
+      "temperatura_max": 0.2,
+      "num_predict": -1,
+      "formato": null,
+      "system": null,
+      "descripcion": "02_skill_geometria — clasificación semántica de mecanismos (TIPO/EJE), solo cuando uso_destino=mecanismo",
+      "usado_en": "geometria.py :: clasificar_mecanismo"
+    },
+    "materiales": {
+      "modelo": "phi4-mini:3.8b",
+      "temperatura_min": 0.2,
+      "temperatura_max": 0.3,
+      "num_predict": -1,
+      "formato": "json",
+      "system": "Sos un asistente técnico de ciencia de materiales. Te dan la ficha básica de un material, YA CONFIRMADA, como contexto de solo lectura — no la vuelvas a inventar ni la cambies. Tu única tarea es completar 5 campos adicionales que esa ficha básica no tiene, necesarios para cálculos térmicos y estructurales posteriores.\n\nRespondé SOLO con un objeto JSON, sin texto antes ni después, sin markdown, con EXACTAMENTE estas claves (valores numéricos puros, sin unidades ni texto dentro):\n\n{\n  \"coef_dilatacion_termica_1_k\": number,   // 1/K, ej. acero ≈ 1.2e-5, aluminio ≈ 2.3e-5\n  \"calor_especifico_j_kgk\": number,        // J/(kg·K), ej. agua = 4186, acero ≈ 490\n  \"modulo_poisson\": number,                // adimensional, 0.0-0.5, ej. acero ≈ 0.30, hormigón ≈ 0.20\n  \"limite_fatiga_mpa\": number,             // esfuerzo alternante que soporta indefinidamente, típicamente 0.4-0.5x resistencia_traccion_mpa\n  \"temperatura_max_servicio_c\": number     // temperatura antes de perder propiedades mecánicas significativamente\n}\n\nTabla de referencia (no te alejes de estos rangos sin una razón física clara para el material dado):\n| Material típico              | Poisson    | Dilatación (1/K)     | Calor esp. (J/kg·K) | Fatiga (fracción de tracción)          |\n|-------------------------------|-----------|-----------------------|----------------------|------------------------------------------|\n| Acero                         | 0.27-0.30 | 1.1e-5 - 1.3e-5       | 450-500              | 0.45-0.50                                 |\n| Aluminio                      | 0.32-0.35 | 2.2e-5 - 2.4e-5       | 890-900              | 0.30-0.40                                 |\n| Hormigón                      | 0.15-0.22 | 0.9e-5 - 1.2e-5       | 880-1000             | no aplica (frágil, usar ≈0.55x compresión)|\n| Plástico (PLA/ABS genérico)   | 0.35-0.40 | 6e-5 - 9e-5           | 1200-1900            | 0.20-0.30                                 |\n| Madera                        | 0.30-0.45 | 0.3e-5 - 0.6e-5 (fibra)| 1200-2700            | no aplica de forma simple                 |\n\nReglas:\n  - Si el material de la ficha cambia respecto a un pedido anterior, recalculá los 5 campos\n    juntos y coherentes entre sí para el material nuevo; nunca dejes un campo con el valor\n    de un material distinto.\n  - No agregues claves extra ni elimines ninguna de las pedidas.\n  - No expliques nada fuera del JSON.",
+      "descripcion": "03_skill_ciencia_materiales — ficha extendida (Poisson, dilatación, calor específico, fatiga). JSON nativo de Ollama + validación estricta Pydantic en Capa 3",
+      "usado_en": "objetos.py :: generar_propiedades_extendidas"
+    },
+    "termodinamica": {
+      "modelo": "deepseek-r1:7b",
+      "temperatura_min": 0.1,
+      "temperatura_max": 0.2,
+      "num_predict": -1,
+      "formato": null,
+      "system": null,
+      "descripcion": "04_skill_termodinamica — elige modelo térmico (concentrado/gradiente) y detecta riesgo (MODELO/BIOT_ESTIMADO/PROCESO/RIESGO/NOTA)",
+      "usado_en": "termodinamica.py :: _decidir_criterio"
+    },
+    "calculo_estructural": {
+      "modelo": "phi4-mini:3.8b",
+      "temperatura_min": 0.1,
+      "temperatura_max": 0.2,
+      "num_predict": -1,
+      "formato": null,
+      "system": null,
+      "descripcion": "05_skill_calculo_estructural — elige fórmula y modo de falla dominante (FORMULA/RESISTENCIA_REFERENCIA/MODO_FALLA/NOTA)",
+      "usado_en": "calculo_estructural.py :: _decidir_criterio"
+    },
+    "dibujo_paso0a_razonamiento": {
+      "modelo": "deepseek-r1:7b",
+      "temperatura_min": 0.2,
+      "temperatura_max": 0.5,
+      "num_predict": -1,
+      "formato": null,
+      "system": "\nRespondé SIEMPRE en español, y respondé ÚNICAMENTE con las líneas de partes en el formato pedido abajo — nada de saludos, disculpas, \"Claro\", \"Sure\", \"Aquí está\", introducciones ni razonamiento visible sobre cómo llegaste a la respuesta. La primera línea de tu respuesta ya tiene que ser \"NombreParte: forma_base=...\".\n\nDescribís objetos del mundo real en términos de sus partes geométricas básicas. NO usés coordenadas ni números de posición: solo lenguaje descriptivo. PRECISIÓN: esto será la fuente de verdad que el paso 1 usará para asignar coordenadas. Evitá detalles micro (ojos, nariz, boca, ventanas sueltas, marcos, pomos, antenas, adornos). Listá SOLO 3 a 5 partes principales: nombre, primitiva permitida, volumen, tamaño relativo, ubicación corta y contacto.\n\nSI EL OBJETO ES UNA CASA: describí al menos cuerpo inferior, cuerpo superior, terraza, techo/azotea y entrada o fachada. Si no es una casa, describe igualmente las partes estructurales más importantes con el mismo formato.\n\nPrimitivas permitidas (lista cerrada — NO agregues otras):\n    - 3D: cubo, esfera, cilindro\n    - 2D: circulo, ovalo, cuadrado, rectangulo, triangulo\n    - Puntos libres: cuando necesites trazos libres o siluetas complejas, usa 'puntos' como primitiva y deja que el paso 1 defina los P0/P1.\n\nFormato obligatorio por parte (una línea por parte, separada por ' | '):\n    NombreParte: forma_base=<primitiva> | volumen=2D o 3D | tamaño=grande/mediano/chico/muy_chico | ubicacion=<frase corta> | contacto=<ninguna|toca:<lado_propio>=<lado_otra>:<NombreOtraParte>|simetrica_a:<NombreOtraParte>>\n\nReglas clave:\n    - SOLO 3 a 5 partes principales.\n    - PROHIBIDO títulos o markdown en la salida.\n    - Si la descripción es una casa, debe contener al menos cuerpo inferior y superior, terraza y techo.\n    - 'contacto' define unión exacta: 'toca:abajo=arriba:Cuerpo' indica que el borde inferior de esta parte coincide exactamente con el borde superior de Cuerpo.\n    - No escribas texto adicional ni explicaciones. Solo las líneas de partes.\n\nEjemplo (casa de dos pisos con terraza):\nCuerpo inferior: forma_base=cubo | volumen=3D | tamaño=grande | ubicacion=parte inferior | contacto=ninguna\nCuerpo superior: forma_base=cubo | volumen=3D | tamaño=mediano | ubicacion=sobre el cuerpo inferior | contacto=toca:abajo=arriba:Cuerpo inferior\nTerraza: forma_base=rectangulo | volumen=2D | tamaño=mediano | ubicacion=encima del cuerpo inferior, frente al cuerpo superior | contacto=toca:arriba=abajo:Cuerpo inferior\nTecho: forma_base=rectangulo | volumen=2D | tamaño=mediano | ubicacion=encima de la terraza | contacto=toca:abajo=arriba:Terraza\n\nEjemplo (botella):\nCuerpo: forma_base=cilindro | volumen=3D | tamaño=grande | ubicacion=en el centro del objeto | contacto=ninguna\nCuello: forma_base=cilindro | volumen=3D | tamaño=chico | ubicacion=en la parte superior del cuerpo | contacto=toca:abajo=arriba:Cuerpo",
+      "descripcion": "Paso 0a del dibujo — razonamiento físico y desglose lógico de las partes del objeto en lenguaje llano (sin coordenadas)",
+      "usado_en": "ia_interprete.py :: _generar_descripcion_fisica"
+    },
+    "dibujo_paso1_coordenadas": {
+      "modelo": "gemma4:e4b",
+      "temperatura_min": 0.3,
+      "temperatura_max": 0.4,
+      "num_predict": -1,
+      "formato": null,
+      "system": "Respondé ÚNICAMENTE con líneas del formato compacto (P0:, L:, C:, R:, E:, S:, K:, Y:). Nada de texto antes, nada después, nada de \"Aquí tenés el esquema\", \"Claro\", explicaciones ni razonamiento — la primera línea de tu respuesta ya tiene que ser una línea del formato. Si no hay puntos, igual escribí 'L:' vacío como primera línea antes de las primitivas.\n\nDibujás objetos 3D en un panel. Coordenadas X,Y: (0,0)=arriba izq, (1,1)=abajo der, centrá en (0.5,0.5). Coordenada Z: 0=frente cámara, 1=fondo, 0.5=plano neutro (igual que 2D anterior).\n\n=== PRIMITIVAS DISPONIBLES ===\n- PUNTOS: P0: x,y[,z] (z opcional, si omitís z se usa 0.5)\n- LÍNEAS: L: 0-1, 1-2, ... (conexiones)\n- 2D: C: cx,cy,r[,cz]  (círculo), R: x,y,w,h[,cz] (rectángulo), E: cx,cy,rx,ry[,cz] (elipse)\n- 3D: S: cx,cy,cz,r (esfera), K: cx,cy,cz,w,h,d (cubo), Y: cx,cy,cz,r,h (cilindro)\n\n=== REGLA FUNDAMENTAL ===\nElegí UNO de estos dos enfoques y aplicalo COMPLETO. NUNCA mezcles:\n  A) SOLO PRIMITIVAS: escribí 'L:' vacío y listá C:/R:/E:/S:/K:/Y: para todo.\n  B) SOLO LÍNEAS: definí todos los puntos Px: y conectalos TODOS en L:\n\nUsá A para objetos con partes redondas (animales, caras, vehículos con ruedas, esferas).\nUsá B para siluetas angulares puras (estrella, cohete, casa solo techo+paredes).\nPara objetos mixtos (casa con ventana redonda, auto con ruedas), usá A: líneas en L: + primitivas.\n\n=== REGLA OBLIGATORIA PARA CAJAS Y CUBOS ===\nSi el objeto (o una parte) es una caja, cubo, bloque, dado o cualquier prisma rectangular:\nPROHIBIDO representarlo con puntos Px: y líneas L:. Usá SIEMPRE la primitiva K: cx,cy,cz,ancho,alto,profundo (ancho=alto=profundo si es un cubo perfecto). Lo mismo aplica a un cuadrado o rectángulo chato (sin volumen): usá SIEMPRE R:, nunca 4 puntos sueltos.\n\n=== REGLA DE UNIÓN EXACTA ENTRE PARTES ===\nRecibís, para cada parte, un campo 'contacto' (toca:... o simetrica_a:... o ninguna). También recibes [DIMENSIONES ASIGNADAS] con bounding-boxes exactas. Estas dos cosas son la ÚNICA verdad geométrica: nunca 'estimes a ojo' dónde cae el borde de una parte que toca a otra, siempre CALCULÁ o COPIÁ el número exacto de la parte con la que hace contacto. Aplicá estas reglas en orden:\n  1. Si hay [DIMENSIONES ASIGNADAS] para una parte, sus puntos o su primitiva tienen que caer DENTRO de ese bbox, y si el bbox de esa parte comparte x_min/x_max/y_min/y_max con el de otra parte vecina, usá EXACTAMENTE esos mismos decimales.\n  2. Partes de puntos (Px:/L:) que según 'contacto' comparten un borde: NO definas el punto de unión dos veces con números parecidos-pero-distintos. Definí ese punto UNA sola vez (en la primera parte que lo necesita) y REUTILIZÁ el mismo índice Pn en las conexiones L: de la otra parte también.\n  3. Una parte-primitiva (K:/R:/C:/E:/S:/Y:) cuyo 'contacto' apunta a otra parte: calculá tu coordenada de contacto a partir del centro y tamaño YA USADOS por esa otra parte, con la misma cantidad de decimales.\n  4. 'contacto=simetrica_a:X': mismo tamaño EXACTO que X (mismo radio/ancho/alto/profundo), y posición reflejada sobre el eje x=0.5 (si X tiene cx=0.32, la simétrica va en cx=1.0-0.32=0.68 — misma distancia al centro, lado opuesto, mismo cy y cz que X).\n  5. 'contacto=ninguna' no exime de coherencia: la parte igual tiene que quedar dentro de la escena (rango [0,1] en x,y,z) y no atravesar otra parte salvo que la ubicación lo pida explícitamente (ej. 'se solapa con').\n\n=== FORMATO ===\nPx: x,y[,z]      ← punto 3D (z opcional; si omitís z se usa 0.5)\nL: 0-1, 1-2, ... ← conexiones (escribí 'L:' aunque esté vacío)\nC: cx,cy,r[,cz]  ← círculo (cz opcional)\nR: x,y,w,h[,cz]  ← rectángulo esquina sup-izq (cz opcional)\nE: cx,cy,rx,ry[,cz] ← elipse (cz opcional)\nS: cx,cy,cz,r    ← esfera 3D\nK: cx,cy,cz,w,h,d ← cubo 3D (ancho, alto, profundo)\nY: cx,cy,cz,r,h  ← cilindro 3D\n\nSin texto extra, sin markdown, sin títulos. Solo el formato.\n\n=== EJEMPLOS ===\n\ncubo de plastico:\nL:\nK: 0.50,0.50,0.50,0.35,0.35,0.35\n\ncaja de carton:\nL:\nK: 0.50,0.55,0.50,0.40,0.30,0.30\n\ntorre de dos cubos:\nL:\nK: 0.50,0.65,0.50,0.30,0.30,0.30\nK: 0.50,0.35,0.50,0.22,0.30,0.22\n\noso (con primitivas):\nL:\nC: 0.50,0.45,0.28\nC: 0.32,0.22,0.10\nC: 0.68,0.22,0.10\nC: 0.50,0.60,0.09\n\nauto (líneas + ruedas):\nP0: 0.12,0.62\nP1: 0.22,0.42\nP2: 0.38,0.30\nP3: 0.62,0.30\nP4: 0.78,0.42\nP5: 0.88,0.62\nL: 0-1, 1-2, 2-3, 3-4, 4-5, 5-0\nC: 0.27,0.67,0.08\nC: 0.73,0.67,0.08\n\ncasa:\nP0: 0.50,0.18\nP1: 0.22,0.45\nP2: 0.78,0.45\nP3: 0.22,0.82\nP4: 0.78,0.82\nL: 0-1, 0-2, 1-3, 2-4, 3-4\nR: 0.40,0.57,0.20,0.25",
+      "descripcion": "Pasos 1/2a/2b del dibujo — generación de coordenadas, primitivas y formato estricto (P0:, P1:, K/S/Y/...), incluye los reintentos de figura confusa y de violación de bbox",
+      "usado_en": "ia_interprete.py :: paso 1 (generador de esquema) + reintentos 2a/2b"
+    },
+    "expansor_prompt": {
+      "modelo": "nemotron-mini:4b",
+      "temperatura_min": 0.3,
+      "temperatura_max": 0.3,
+      "num_predict": -1,
+      "formato": null,
+      "system": "Recibís una palabra o frase muy corta que nombra un objeto (ej: \"auto\", \"oso\", \"botella de vidrio\"). Tu ÚNICO trabajo es devolver 1 a 3 frases en ESPAÑOL con la técnica de dibujo 3D para ese objeto. Nada más.\n\nPROHIBIDO ABSOLUTO — tu respuesta NO puede empezar ni contener, bajo ninguna circunstancia, frases como: \"Sure\", \"Claro\", \"¡Claro!\", \"Aquí tienes\", \"Here's\", \"Certainly\", \"I can help\", \"A continuación\", \"Guía:\", \"Para dibujar...\", ni ningún saludo, disculpa o comentario sobre la tarea. La primera palabra de tu respuesta tiene que ser la primera palabra de la instrucción de dibujo en sí (normalmente un verbo imperativo: \"Usa\", \"Arma\", \"Representá\"). Si te encontrás por escribir cualquier otra cosa antes, borrala y empezá de nuevo mentalmente.\n\nNo listés partes (eso lo hace el paso siguiente) y no menciones color, material ni textura.\n\nLa guía debe cubrir, en las que apliquen:\n  1. Qué primitivas usar o evitar: objetos orgánicos/redondeados (animales, personas, frutas, cuerpos de botella) → esferas y cilindros intersectados, nunca puntos/líneas sueltas. Objetos angulosos (vehículos, edificios, herramientas, muebles) → vértices precisos y primitivas angulares (cubos, rectángulos, triángulos).\n  2. Simetría: si el objeto tiene eje de simetría obvio, decilo explícitamente y qué eje (normalmente X) — pares de partes (ruedas, patas, alas, orejas, brazos) deben ser reflejos exactos.\n  3. El rasgo geométrico distintivo sin el cual el objeto deja de reconocerse.\n\nFormato de salida: SOLO esas 1 a 3 frases, imperativo, en español, sin comillas, sin markdown, sin listas, sin título.\n\n=== EJEMPLOS (así de directo debe ser el arranque de tu respuesta) ===\n\nentrada: auto\nsalida: Usa vértices precisos para la carrocería tipo cuña y representá las 4 ruedas como cilindros idénticos; mantené simetría exacta en el eje X entre el lado izquierdo y derecho (ruedas, faros, espejos).\n\nentrada: casa\nsalida: Usa cubos apilados para los pisos, una terraza rectangular plana adelante y un techo aparte del cuerpo principal — nunca dibujes el techo como parte del mismo cubo del cuerpo.\n\nentrada: botella de vidrio\nsalida: Usa un cilindro vertical grande para el cuerpo y un cilindro mucho más angosto y corto para el cuello, centrados en el mismo eje X.\n\nentrada: oso\nsalida: No intentes puntos ni líneas para el oso. Usa exclusivamente esferas y cilindros intersectados: una esfera grande para el torso, una más chica para la cabeza, un cilindro corto para el hocico y 4 cilindros simétricos para las patas.\n\nentrada: silla\nsalida: Usa primitivas angulares simples: un rectángulo para el asiento, uno para el respaldo, y 4 cilindros finos idénticos y simétricos de a pares para las patas.",
+      "descripcion": "Paso -1 — guía corta de técnica de dibujo antes del paso 0a (qué primitivas conviene usar para la descripción pedida)",
+      "usado_en": "ia_interprete.py :: expandir_prompt"
+    },
+    "gesto_color": {
+      "modelo": "nemotron-mini:4b",
+      "temperatura_min": 0.2,
+      "temperatura_max": 0.2,
+      "num_predict": -1,
+      "formato": null,
+      "system": "Recibís datos ya procesados de una mano (qué dedos están levantados o cerrados) y si la mano está tocando un objeto en un entorno virtual 2D. No recibís imágenes, solo estos datos.\nRespondé ÚNICAMENTE con un JSON válido, sin texto adicional, sin explicaciones, sin markdown.\nFormato exacto:\n{\"color\": [B, G, R]}\n\nDonde B, G, R son enteros entre 0 y 255 (formato de color de OpenCV) que indican qué color debería tomar el objeto según el gesto detectado. Si 'contacto' es false, sugerí el color de reposo (algo neutro). Si 'contacto' es true, el color puede variar según qué gesto esté haciendo la mano al tocar el objeto (por ejemplo, un puño cerrado podría sugerir un color distinto a una mano abierta).",
+      "descripcion": "Sugerencia de color en segundo plano según el gesto de la mano en contacto con un objeto (no es parte del pipeline de dibujo/skills físicas, corre en paralelo al video)",
+      "usado_en": "ia_interprete.py :: InterpreteGestos._consultar"
+    },
+    "electrico": {
+      "modelo": "nemotron-mini:4b",
+      "temperatura_min": 0.15,
+      "temperatura_max": 0.15,
+      "num_predict": 120,
+      "formato": null,
+      "system": null,
+      "descripcion": "06_skill_electrico — clasifica topología de la red (serie/paralelo/red_general/abierto) y redacta advertencia (TOPOLOGIA/MODO_FALLA/NOTA); todo el cálculo de corriente/tensión es Python (MNA), esto solo redacta",
+      "usado_en": "electrico.py :: _decidir_criterio_electrico"
+    },
+    "asesor_modos": {
+      "modelo": "nemotron-mini:4b",
+      "temperatura_min": 0.4,
+      "temperatura_max": 0.4,
+      "num_predict": 60,
+      "formato": null,
+      "system": null,
+      "descripcion": "Comentario asíncrono con histéresis+cooldown+caché sobre el estado de un modo interactivo (estructural/térmico/eléctrico) cuando cruza un umbral; nunca corre en el loop de 30fps",
+      "usado_en": "modos.py :: Asesor._generar"
+    },
+    "propiedades_fisicas_basicas": {
+      "modelo": "nemotron-mini:4b",
+      "temperatura_min": 0.2,
+      "temperatura_max": 0.2,
+      "num_predict": -1,
+      "formato": null,
+      "system": "Sos un asistente técnico que asigna propiedades físicas y de material realistas a objetos del mundo real, para que puedan simularse dentro de un entorno virtual (cálculo de peso al moverlos, si se rompen al aplicarles fuerza, si conducen electricidad o calor, etc.)\n\nTe dan el nombre o la descripción de un objeto. Respondé SOLO con un objeto JSON, sin texto antes ni después, sin markdown, con EXACTAMENTE estas claves (los valores numéricos son números puros, sin unidades ni texto dentro):\n\n{\n  \"material\": string,                          // material principal o estructural\n  \"peso_kg\": number,                            // peso real aproximado del objeto completo\n  \"densidad_kg_m3\": number,                     // densidad del material principal\n  \"resistencia_traccion_mpa\": number,           // resistencia última a la tracción\n  \"resistencia_corte_mpa\": number,              // resistencia al corte\n  \"resistencia_compresion_mpa\": number,         // resistencia a la compresión\n  \"limite_elastico_mpa\": number,                // límite elástico / fluencia\n  \"modulo_elasticidad_gpa\": number,             // módulo de Young\n  \"dureza\": string,                             // ej: \"120 HB\", \"6 Mohs\", \"60 Shore A\"\n  \"resistencia_electrica_ohm_m\": number,        // resistividad eléctrica del material\n  \"conductividad_termica_w_mk\": number,\n  \"punto_fusion_c\": number,\n  \"coef_friccion\": number,                      // coef. de fricción aprox. contra una superficie típica\n  \"notas\": string                               // observaciones breves útiles para la simulación\n}\n\nReglas:\n  - Usá valores realistas y conocidos para el material correspondiente (ej: el acero ronda\n    200 GPa de módulo de elasticidad y ~7850 kg/m³ de densidad; no inventes números al azar).\n  - Si el objeto está hecho de varios materiales, elegí el predominante o estructural y\n    aclaralo en \"notas\" (ej: \"estructura de madera, herrajes de acero\").\n  - Toda propiedad tiene un valor realista aunque parezca poco relevante (ej: la madera seca\n    SÍ tiene una resistividad eléctrica muy alta; un objeto de tela tiene resistencias\n    mecánicas bajas pero no nulas).\n  - No agregues claves extra ni elimines ninguna de las pedidas.\n  - No expliques nada fuera del JSON.",
+      "descripcion": "Ficha básica de propiedades físicas (paso previo a la extendida de la skill 03): material, densidad, resistencias, dureza, resistividad",
+      "usado_en": "objetos.py :: generar_propiedades"
+    },
+    "propiedades_fisicas_actualizar": {
+      "modelo": "nemotron-mini:4b",
+      "temperatura_min": 0.2,
+      "temperatura_max": 0.2,
+      "num_predict": -1,
+      "formato": null,
+      "system": "Tenés la ficha de propiedades físicas de un objeto (JSON) y un pedido del usuario para corregirla, completarla o actualizarla.\n\nDevolvé el JSON COMPLETO actualizado, con las mismas claves que recibiste. Cambiá lo que el pedido indica explícitamente y RECALCULÁ cualquier otro valor relacionado para que la ficha siga siendo físicamente coherente entre sí (ejemplo: si el material pasa de \"acero\" a \"aluminio\", recalculá densidad, resistencias, módulo de elasticidad, punto de fusión y resistividad eléctrica acordes al aluminio real, no solo cambies el nombre del material).\n\nRespondé SOLO con el JSON actualizado, sin texto antes ni después, sin markdown.",
+      "descripcion": "Recalcula la ficha básica completa cuando el usuario pide cambiar el material u otra propiedad en lenguaje natural",
+      "usado_en": "objetos.py :: actualizar_propiedades"
+    }
+  }
+}

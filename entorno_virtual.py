@@ -129,6 +129,89 @@ def _malla_cilindro(r, alto, segmentos=14):
     return puntos, aristas
 
 
+_COLOR_NOMBRE_A_BGR = {
+    "rojo":   (0, 0, 255),
+    "verde":  (0, 180, 0),
+    "azul":   (255, 0, 0),
+    "amarillo": (0, 220, 220),
+    "naranja": (0, 140, 255),
+    "morado": (200, 0, 200),
+    "rosa":   (203, 192, 255),
+    "cian":   (255, 255, 0),
+    "gris":   (140, 140, 140),
+    "blanco": (255, 255, 255),
+    "negro":  (0, 0, 0),
+    "marron": (42, 42, 165),
+    "marrón": (42, 42, 165),
+}
+
+_DEFAULT_PRIMITIVE_COLORS = {
+    "cubo":      (120, 170, 220),
+    "cilindro":  (120, 200, 160),
+    "esfera":    (160, 140, 240),
+    "rectangulo":(215, 160, 120),
+    "circulo":   (120, 220, 190),
+    "elipse":    (160, 200, 220),
+}
+
+_PALETTE = [
+    (190, 120, 240),
+    (80, 200, 170),
+    (180, 160, 70),
+    (90, 180, 240),
+    (220, 100, 110),
+    (140, 220, 120),
+]
+
+
+def _parse_color_value(value):
+    if isinstance(value, (list, tuple)) and len(value) == 3:
+        try:
+            return tuple(int(max(0, min(255, v))) for v in value)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(value, str):
+        valor = value.strip().lower()
+        if valor in _COLOR_NOMBRE_A_BGR:
+            return _COLOR_NOMBRE_A_BGR[valor]
+        if valor.startswith("#") and len(valor) == 7:
+            try:
+                r = int(valor[1:3], 16)
+                g = int(valor[3:5], 16)
+                b = int(valor[5:7], 16)
+                return (b, g, r)
+            except ValueError:
+                return None
+        if valor.startswith("0x") and len(valor) == 8:
+            try:
+                r = int(valor[2:4], 16)
+                g = int(valor[4:6], 16)
+                b = int(valor[6:8], 16)
+                return (b, g, r)
+            except ValueError:
+                return None
+    return None
+
+
+def _color_para_primitiva(prim, idx):
+    if "color" in prim:
+        parsed = _parse_color_value(prim["color"])
+        if parsed is not None:
+            return parsed
+    tipo = prim.get("tipo")
+    if tipo in _DEFAULT_PRIMITIVE_COLORS:
+        return _DEFAULT_PRIMITIVE_COLORS[tipo]
+    return _PALETTE[idx % len(_PALETTE)]
+
+
+def _fill_poly_alpha(panel, polygon, color, alpha=0.28):
+    if polygon is None or len(polygon) < 3:
+        return
+    overlay = panel.copy()
+    cv2.fillPoly(overlay, [polygon], color)
+    cv2.addWeighted(overlay, alpha, panel, 1.0 - alpha, 0, dst=panel)
+
+
 # ---------------------------------------------------------------------------
 # Figura3D
 # ---------------------------------------------------------------------------
@@ -188,7 +271,72 @@ class Figura3D:
             return 0.0
         return sum(proyector(p)[1] for p in puntos) / len(puntos)
 
+    def _puntos_mundo_primitiva(self, prim):
+        cx, cy, cz = prim["centro"]
+        return [(lx + cx, ly + cy, lz + cz)
+                for lx, ly, lz in prim["puntos_locales"]]
+
+    def _color_primitiva(self, prim, idx):
+        return _color_para_primitiva(prim, idx)
+
+    def _dibujar_primitiva(self, panel, prim, proyector, color, alpha=0.28):
+        if "puntos_locales" not in prim or "centro" not in prim:
+            return
+        puntos_mundo = self._puntos_mundo_primitiva(prim)
+        proyectados = [proyector(p) for p in puntos_mundo]
+        puntos2d = [pt for pt, _ in proyectados]
+        z_vals = [z for _, z in proyectados]
+        tipo = prim.get("tipo")
+
+        if tipo in ("rectangulo", "circulo", "elipse"):
+            polygon = np.array(puntos2d, dtype=np.int32)
+            _fill_poly_alpha(panel, polygon, color, alpha)
+        elif tipo == "esfera":
+            if len(puntos2d) >= 3:
+                pts = np.array(puntos2d, dtype=np.int32)
+                hull = cv2.convexHull(pts)
+                _fill_poly_alpha(panel, hull, color, alpha)
+        elif tipo == "cubo":
+            faces = [
+                (0,1,2,3), (4,5,6,7),
+                (0,1,5,4), (2,3,7,6),
+                (1,2,6,5), (0,3,7,4),
+            ]
+            face_polygons = []
+            for face in faces:
+                poly = np.array([puntos2d[i] for i in face], dtype=np.int32)
+                depth = sum(z_vals[i] for i in face) / len(face)
+                face_polygons.append((depth, poly))
+            for _, poly in sorted(face_polygons, key=lambda item: item[0], reverse=True):
+                _fill_poly_alpha(panel, poly, color, alpha)
+        elif tipo == "cilindro":
+            if len(puntos2d) >= 6:
+                n = len(puntos2d) // 2
+                top = np.array(puntos2d[:n], dtype=np.int32)
+                bottom = np.array(puntos2d[n:], dtype=np.int32)
+                side = np.array(puntos2d[:n] + puntos2d[n:][::-1], dtype=np.int32)
+                face_polygons = [
+                    (sum(z_vals[:n]) / n, top),
+                    (sum(z_vals[n:]) / n, bottom),
+                    (sum(z_vals) / len(z_vals), side),
+                ]
+                for _, poly in sorted(face_polygons, key=lambda item: item[0], reverse=True):
+                    _fill_poly_alpha(panel, poly, color, alpha)
+        else:
+            return
+
+        if len(puntos2d) >= 2:
+            edge_color = tuple(max(0, int(c * 0.75)) for c in color)
+            for i, j in prim["aristas"]:
+                pa, _ = proyectados[i]
+                pb, _ = proyectados[j]
+                cv2.line(panel, pa, pb, edge_color, 2)
+
     def dibujar(self, panel, proyector):
+        for idx, prim in enumerate(self.primitivas):
+            prim_color = self._color_primitiva(prim, idx)
+            self._dibujar_primitiva(panel, prim, proyector, prim_color)
+
         color = self.color_tocado if self.tocado else self.color_normal
         for a, b in self.segmentos_mundo():
             pa, _ = proyector(a)
@@ -197,10 +345,6 @@ class Figura3D:
         for p in self.puntos:
             pp, _ = proyector(p)
             cv2.circle(panel, pp, 5, color, -1)
-        for a, b in self.primitivas_segmentos_mundo():
-            pa, _ = proyector(a)
-            pb, _ = proyector(b)
-            cv2.line(panel, pa, pb, color, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -461,7 +605,11 @@ class EntornoVirtual:
         else:
             return None
 
-        return {"centro": [cx, cy, cz], "puntos_locales": locales, "aristas": aristas}
+        prim_mundo = dict(prim)
+        prim_mundo["centro"] = [cx, cy, cz]
+        prim_mundo["puntos_locales"] = locales
+        prim_mundo["aristas"] = aristas
+        return prim_mundo
 
     # ------------------------------------------------------------------
     # Colisión (en espacio de pantalla)

@@ -34,6 +34,15 @@ from geo_utils import segmentos_cruzan as _segmentos_se_cruzan  # test de cruce:
 CACHE_DIR = "figuras_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+# Caché del paso -1 (expansor de prompt, ver más abajo) — carpeta separada a
+# propósito (mismo criterio que el resto del proyecto: "cachear por skill",
+# nunca todo junto) porque acá se cachea un TEXTO de guía de técnica de
+# dibujo, no una figura ya resuelta; si en algún momento se quiere invalidar
+# solo los prompts expandidos (ej. se mejoró SYSTEM_EXPANSOR_PROMPT) sin
+# perder las figuras ya generadas, alcanza con borrar esta carpeta sola.
+PROMPT_CACHE_DIR = "prompts_expandidos_cache"
+os.makedirs(PROMPT_CACHE_DIR, exist_ok=True)
+
 
 def _nombre_archivo_cache(descripcion: str) -> str:
     nombre = descripcion.lower().strip()
@@ -99,86 +108,51 @@ def figuras_en_cache() -> list[str]:
             pass
     return resultado
 
+
+def _nombre_archivo_cache_prompt(descripcion: str) -> str:
+    """Mismo saneo de nombre que _nombre_archivo_cache(), pero apuntando a
+    PROMPT_CACHE_DIR — no se reutiliza la carpeta de figuras porque son dos
+    cachés de contenido distinto (ver comentario junto a PROMPT_CACHE_DIR)."""
+    nombre = descripcion.lower().strip()
+    nombre = "".join(
+        c for c in unicodedata.normalize("NFD", nombre)
+        if unicodedata.category(c) != "Mn"
+    )
+    nombre = re.sub(r"[^a-z0-9 ]+", "", nombre)
+    nombre = re.sub(r"\s+", "_", nombre)
+    return os.path.join(PROMPT_CACHE_DIR, nombre[:60] + ".txt")
+
+
+def _guardar_cache_prompt(descripcion: str, prompt_expandido: str) -> None:
+    ruta = _nombre_archivo_cache_prompt(descripcion)
+    with open(ruta, "w", encoding="utf-8") as f:
+        f.write(f"descripcion: {descripcion}\n")
+        f.write(f"prompt_expandido: {prompt_expandido}\n")
+        f.write(f"generado: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+
+def _cargar_cache_prompt(descripcion: str) -> str | None:
+    ruta = _nombre_archivo_cache_prompt(descripcion)
+    if not os.path.exists(ruta):
+        return None
+    try:
+        with open(ruta, "r", encoding="utf-8") as f:
+            for linea in f:
+                if linea.startswith("prompt_expandido:"):
+                    return linea.split(":", 1)[1].strip()
+    except Exception as e:
+        print(f"[caché prompt] Error al leer: {e}")
+    return None
+
 MODELO = "kwangsuklee/Qwen3.5-4B.Q4_K_M-Claude-4.6-Opus-Reasoning-Distilled-v2"
 
 # ---------------------------------------------------------------------------
-# Catálogo de figuras base (2D y 3D) — hardcodeado en figuras_base.json
-#
-# Por qué hace falta: dejar que el modelo "invente" las coordenadas de un cubo
-# punto por punto es exactamente lo que generaba el bug (una figura como si
-# fuera un cierre relámpago en vez de un cubo: 6 puntos conectados en cadena,
-# porque el modelo no sabe cerrar bien un contorno rectangular a mano).
-#
-# La solución es sacarle esa responsabilidad al modelo para las formas más
-# comunes: este catálogo define, de una vez y en código Python (no en el LLM),
-# la geometría "unitaria" (centrada en el origen, tamaño 1) de cada figura
-# base — tanto 2D (círculo, cuadrado, triángulo, estrella, ...) como 3D
-# (cubo, esfera, cilindro, pirámide, ...). El modelo SOLO tiene que decidir
-# QUÉ figura base usar para cada parte del objeto (algo que hace bien, es
-# clasificación) y en qué bounding-box va (eso ya lo resuelve el paso 0b).
-# Con esos dos datos, `_ensamblar_figura_por_catalogo()` hace el trabajo
-# geométrico: escala la plantilla unitaria al tamaño del bbox y la traslada
-# a su posición — sin que el LLM tenga que calcular ni un solo número.
+# Catálogo eliminado: ya no usamos `figuras_base.json` como catálogo externo.
+# En su lugar definimos explícitamente, en los SYSTEM prompts de las skills,
+# un conjunto reducido y estable de primitivas permitidas que los modelos deben
+# respetar. Esto evita confusión en modelos locales pequeños y prohíbe la
+# descomposición en micro-detalles (ojos, narices, marcos, etc.).
 # ---------------------------------------------------------------------------
-
-CATALOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "figuras_base.json")
-
-_CATALOGO_CACHE: dict | None = None
-
-
-def _cargar_catalogo() -> dict:
-    """Carga (y cachea en memoria) el catálogo de figuras base desde el JSON."""
-    global _CATALOGO_CACHE
-    if _CATALOGO_CACHE is not None:
-        return _CATALOGO_CACHE
-    try:
-        with open(CATALOGO_PATH, "r", encoding="utf-8") as f:
-            _CATALOGO_CACHE = json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
-        print(f"[catálogo] No se pudo cargar {CATALOGO_PATH}: {e}")
-        _CATALOGO_CACHE = {"2D": {}, "3D": {}}
-    return _CATALOGO_CACHE
-
-
-def _normalizar_texto(s: str) -> str:
-    """minúsculas, sin acentos, sin espacios de sobra — para comparar nombres de forma
-    tolerante a como los escriba el modelo o el usuario."""
-    s = s.lower().strip()
-    s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
-    return re.sub(r"\s+", "_", s)
-
-
-def _resolver_forma_base(nombre_forma: str) -> tuple[str, str, dict] | None:
-    """Busca `nombre_forma` (tal como lo escribió el modelo) en el catálogo, por
-    clave exacta o por alias. Devuelve (clave_canonica, categoria, definicion) o
-    None si no está en el catálogo (en ese caso, se recurre al LLM como antes)."""
-    if not nombre_forma:
-        return None
-    objetivo = _normalizar_texto(nombre_forma)
-    catalogo = _cargar_catalogo()
-    for categoria in ("3D", "2D"):
-        for clave, defin in catalogo.get(categoria, {}).items():
-            candidatos = {_normalizar_texto(clave)} | {
-                _normalizar_texto(a) for a in defin.get("aliases", [])
-            }
-            if objetivo in candidatos:
-                return clave, categoria, defin
-    return None
-
-
-def _texto_catalogo_para_prompt() -> str:
-    """Serializa el catálogo a texto legible para inyectarlo en el prompt del
-    descriptor físico (paso 0a), como lista cerrada de opciones válidas."""
-    catalogo = _cargar_catalogo()
-    lineas = []
-    for categoria, etiqueta in (("3D", "Formas base 3D (objetos con volumen)"),
-                                 ("2D", "Formas base 2D (siluetas planas)")):
-        lineas.append(f"{etiqueta}:")
-        for clave, defin in catalogo.get(categoria, {}).items():
-            alias = defin.get("aliases", [])
-            alias_txt = f" (alias: {', '.join(alias)})" if alias else ""
-            lineas.append(f"  - {clave}{alias_txt}: {defin.get('descripcion', '')}")
-    return "\n".join(lineas)
 
 # ----------------------------------------------------------------------------------
 # Paso 0: descripción física en lenguaje llano, SIN coordenadas.
@@ -192,120 +166,140 @@ def _texto_catalogo_para_prompt() -> str:
 # medio de la cara, hocico arriba de los ojos, etc.).
 # ----------------------------------------------------------------------------------
 
-SYSTEM_DESCRIPCION_FISICA_BASE = """Describís objetos del mundo real en términos de sus partes geométricas básicas.
-NO usés coordenadas ni números de posición: solo lenguaje descriptivo.
-NO hacés esto por gusto: todo lo que escribas acá es la ÚNICA fuente de verdad que va a usar el
-siguiente paso para poner números. Si acá una unión queda ambigua, en el dibujo final se va a
-notar como un hueco o un cruce entre partes. Precisión acá = precisión en el resultado final.
+# ----------------------------------------------------------------------------------
+# Paso -1: expansor de prompt.
+# Recibe la descripción cruda del usuario ("avión", "auto rojo ferrari", "oso") y
+# devuelve una guía corta de TÉCNICA DE DIBUJO — no una lista de partes (eso lo
+# sigue haciendo el paso 0a) sino una instrucción de una o dos frases sobre CÓMO
+# encarar la geometría de ese objeto en particular: qué primitivas priorizar, qué
+# simetría respetar, qué rasgo distintivo no se puede perder. Es el mismo objeto
+# de siempre, pero con una entrada mucho más pobre (2-4 palabras) de la que el
+# paso 0a puede partir sin ayuda — esta guía achica ese salto.
+#
+# Por qué es un paso aparte y no simplemente "mejorar" SYSTEM_DESCRIPCION_FISICA:
+# mezclar "elegir técnica" con "listar partes con su forma_base exacta" es
+# pedirle al modelo chico dos cosas heterogéneas en la misma llamada (viola la
+# regla 5 de la capa 1 del filtro de ruido — ver skill 00). Separarlas en dos
+# llamadas secuenciales, cada una con un único trabajo, es más confiable.
+# ----------------------------------------------------------------------------------
 
-Para cada parte del objeto, indicá en una línea con este formato EXACTO (separado por " | "):
+# La temperatura y el modelo de este paso ahora se controlan desde
+# modelos_config.json (bloque "expansor_prompt"), no acá.
 
-  - NombreParte: forma_base=<clave_del_catalogo> | volumen=2D o 3D | tamaño=grande/mediano/chico/muy_chico | ubicacion=<frase corta> | contacto=<contrato_de_union>
+SYSTEM_EXPANSOR_PROMPT = """Recibís una descripción muy corta de un objeto (a veces una sola palabra) que
+otro modelo va a tener que dibujar en 3D a partir de puntos, líneas y primitivas (cubos, esferas,
+cilindros). Tu único trabajo es escribir una guía de TÉCNICA DE DIBUJO de 1 a 3 frases para que ese
+segundo paso no se equivoque en las decisiones más comunes. NO listás las partes del objeto (eso lo
+hace el paso siguiente) y NO mencionás color, material, textura ni nada que no sea geometría pura —
+eso lo resuelve otro paso distinto, mezclarlo acá lo confunde.
 
-Reglas para cada campo:
-  - forma_base: tenés que elegir EXACTAMENTE una clave del catálogo de abajo (o uno de sus alias).
-    Es una lista CERRADA: no inventes formas que no estén en el catálogo. Si el objeto real no
-    encaja perfecto en ninguna, elegí la forma base más parecida (ej: una lata de gaseosa es
-    "cilindro", una pantalla de TV es "rectangulo" o "cubo" según si te interesa el volumen).
-  - volumen: "3D" si esa parte tiene un volumen real que importa mostrar (una caja, una pelota,
-    un tubo), "2D" si es más bien una silueta plana (una ventana, un ojo, un logo).
-  - tamaño: relativo a las demás partes del MISMO objeto. Si dos partes forman un par simétrico
-    (oreja izq/der, rueda izq/der, ojo izq/der), las dos llevan EXACTAMENTE la misma palabra de
-    tamaño — nunca "chico" en una y "muy_chico" en la otra, eso después se traduce en un par
-    desparejo en el dibujo.
-  - ubicacion: en una frase corta, dónde va relativa al resto (arriba/abajo/centro/izquierda/
-    derecha/dentro de otra parte).
-  - contacto: describe la unión física con otras partes usando SIEMPRE uno de estos 3 formatos
-    exactos, sin inventar variantes propias:
-      ninguna
-          → la parte no toca a ninguna otra (puede solaparse levemente o flotar cerca, pero no
-            comparte un borde/cara que tenga que coincidir pixel a pixel).
-      toca:<lado_propio>=<lado_de_la_otra>:<NombreOtraParte>
-          → declara qué borde/cara PROPIO coincide EXACTAMENTE (mismo valor numérico, sin
-            aproximar) con qué borde/cara de qué otra parte ya descripta antes. <lado> es
-            siempre uno de: arriba, abajo, izquierda, derecha, centro.
-            Ejemplos: "toca:abajo=arriba:Cuerpo" (mi borde de abajo = borde de arriba del
-            Cuerpo). "toca:arriba=abajo:Carroceria" (mi borde de arriba = borde de abajo de
-            la Carroceria).
-      simetrica_a:<NombreOtraParte>
-          → esta parte es el espejo exacto de otra ya descripta antes en la lista: mismo
-            tamaño y forma, posición reflejada sobre el eje vertical central del objeto.
-    "contacto" es la ÚNICA fuente de verdad sobre qué partes se tocan. El paso siguiente usa
-    literalmente este campo para decidir qué números tienen que repetirse exactos entre dos
-    partes, así que nunca lo dejes en "ninguna" si en el objeto real esas partes se tocan.
+Enfocá la guía en 1, 2 o 3 de estos ejes, los que de verdad apliquen a ESTE objeto (no fuerces los
+tres si no hacen falta):
+  1. Qué primitivas usar (o evitar): si el objeto es orgánico/redondeado (animales, personas, frutas),
+     recomendar ESFERAS y CILINDROS intersectados en vez de puntos y líneas sueltas — un modelo chico
+     casi siempre falla tratando de armar formas curvas a mano con vértices. Si el objeto es anguloso
+     (vehículos, edificios, herramientas), recomendar vértices precisos y primitivas angulares
+     (cubos, rectángulos, triángulos) en vez de círculos.
+  2. Simetría: si el objeto tiene un eje de simetría obvio (la mayoría de vehículos, animales,
+     personas, aviones), recordar explícitamente que las coordenadas deben ser simétricas sobre ese
+     eje (normalmente X) — pares de partes (alas, ruedas, patas, orejas, brazos) tienen que quedar
+     reflejadas exactas, nunca aproximadas a ojo.
+  3. El rasgo distintivo que NO se puede perder: la seña geométrica sin la cual el objeto deja de
+     ser reconocible (las alas y el fuselaje alargado de un avión, el hocico y las 4 patas de un
+     animal, el techo a dos aguas de una casa). Nombrarlo ayuda a que el paso siguiente no lo omita.
 
-Reglas generales:
-  - Listá TODAS las partes visualmente distinguibles del objeto real, en orden lógico: de
-    afuera hacia adentro, o de arriba hacia abajo. Antes de responder, repasá el objeto real
-    de punta a punta (silueta exterior → partes que sobresalen → detalles internos → detalles
-    chicos simétricos) y confirmá que ninguna quedó afuera de la lista. Es preferible listar una
-    parte de más (marcada chica) que olvidar una parte que el objeto realmente tiene.
-  - Un objeto simple (una caja, una pelota, un cubo) puede tener UNA SOLA parte: "Cuerpo".
-    No inventes partes de más si el objeto real no las tiene.
-  - Pensá en proporciones realistas del objeto (ej: las orejas de un oso son chicas comparadas
-    con la cabeza; el techo de una casa es tan ancho como el cuerpo, no más angosto).
-  - Todo par simétrico (izquierda/derecha) se describe con la segunda parte del par usando
-    "contacto=simetrica_a:<primera_parte>", nunca con ubicacion/tamaño inventados por separado
-    que puedan terminar en dos tamaños distintos.
-  - No expliches nada extra, no agregues introducción ni conclusión, no markdown.
-
-=== ROLES CON POSICIÓN AUTOMÁTICA (usalos tal cual si tu parte cumple ese rol) ===
-Si una parte de tu objeto cumple literalmente uno de estos roles, nombrala EXACTAMENTE con una
-de estas palabras clave en NombreParte. Un sistema determinístico (no el modelo) le calcula
-coordenadas exactas a estos roles antes de dibujar, así que usarlos elimina por completo el
-riesgo de que esa parte quede desalineada — es la forma más confiable de garantizar un encastre
-perfecto:
-  cuerpo / carroceria / torso / base / casco / fuselaje  → estructura central del objeto
-  techo / copa                                            → arriba del cuerpo, mismo ancho que él
-  cabeza                                                   → arriba del cuerpo/torso, centrada
-  puerta / entrada                                         → centrada, apoyada en el piso del cuerpo
-  ventana / ojo / ojos                                     → mitad derecha, cuarto superior del cuerpo
-  tronco / pie / pierna / patas                            → debajo del cuerpo, centrado
-  rueda / neumatico / llanta                                → debajo del cuerpo, a los costados
-Si tu parte no encaja en ninguno de estos roles no pasa nada, usá igual el campo "contacto" para
-que quede unida a su vecina sin huecos.
-
-=== CATÁLOGO DE FORMAS BASE (usar SOLO estas claves en forma_base) ===
-{catalogo}
+Formato de salida: SOLO el texto de la guía, 1 a 3 frases, imperativo, sin comillas, sin markdown,
+sin prefijos tipo "Guía:" ni introducciones ("Para dibujar..."). Directo a la instrucción.
 
 === EJEMPLOS ===
 
-cubo de plastico:
-- Cuerpo: forma_base=cubo | volumen=3D | tamaño=grande | ubicacion=ocupa todo el objeto | contacto=ninguna
-
-pelota de futbol:
-- Cuerpo: forma_base=esfera | volumen=3D | tamaño=grande | ubicacion=ocupa todo el objeto | contacto=ninguna
-
-lata de gaseosa:
-- Cuerpo: forma_base=cilindro | volumen=3D | tamaño=grande | ubicacion=ocupa todo el objeto | contacto=ninguna
+avión:
+Usa vértices precisos para dibujar el fuselaje, alas triangulares y alerones. Proporciona
+coordenadas simétricas en el eje X: cada punto del ala/alerón izquierdo debe tener su espejo
+exacto del lado derecho.
 
 oso:
-- Cuerpo: forma_base=circulo | volumen=2D | tamaño=grande | ubicacion=parte inferior del objeto, base de todo | contacto=ninguna
-- Cabeza: forma_base=circulo | volumen=2D | tamaño=grande, un poco mas chica que el cuerpo | ubicacion=arriba del cuerpo | contacto=toca:abajo=arriba:Cuerpo
-- Oreja izquierda: forma_base=circulo | volumen=2D | tamaño=chico | ubicacion=arriba a la izquierda de la cabeza | contacto=toca:abajo=arriba:Cabeza
-- Oreja derecha: forma_base=circulo | volumen=2D | tamaño=chico | ubicacion=arriba a la derecha de la cabeza | contacto=simetrica_a:Oreja izquierda
-- Ojo izquierdo: forma_base=circulo | volumen=2D | tamaño=muy_chico | ubicacion=dentro de la cabeza, a media altura, a la izquierda del centro | contacto=ninguna
-- Ojo derecho: forma_base=circulo | volumen=2D | tamaño=muy_chico | ubicacion=dentro de la cabeza, a media altura, a la derecha del centro | contacto=simetrica_a:Ojo izquierdo
-- Hocico: forma_base=circulo | volumen=2D | tamaño=chico | ubicacion=dentro de la cabeza, debajo de los ojos, centrado | contacto=ninguna
+No intentes dibujar al oso con líneas. Usa exclusivamente ESFERAS y CILINDROS intersectados de
+distintos tamaños para formar el torso, la cabeza, el hocico y las 4 patas.
 
-casa:
-- Cuerpo: forma_base=cubo | volumen=3D | tamaño=grande | ubicacion=mitad inferior del objeto | contacto=ninguna
-- Techo: forma_base=techo_a_dos_aguas | volumen=3D | tamaño=mismo ancho que el cuerpo | ubicacion=arriba del cuerpo | contacto=toca:abajo=arriba:Cuerpo
-- Puerta: forma_base=rectangulo | volumen=2D | tamaño=chico | ubicacion=dentro del cuerpo, centrada horizontalmente, tocando el borde inferior | contacto=toca:abajo=abajo:Cuerpo
-- Ventana: forma_base=circulo | volumen=2D | tamaño=chico | ubicacion=dentro del cuerpo, mitad superior | contacto=ninguna
+auto rojo ferrari:
+Usa vértices precisos para la carrocería y representá las ruedas como cilindros; mantené
+simetría exacta en el eje X entre el lado izquierdo y derecho del auto (ruedas, faros, espejos).
 
-auto:
-- Carroceria: forma_base=rectangulo | volumen=2D | tamaño=grande | ubicacion=centro del objeto | contacto=ninguna
-- Rueda izquierda: forma_base=circulo | volumen=2D | tamaño=chico | ubicacion=abajo a la izquierda de la carroceria | contacto=toca:arriba=abajo:Carroceria
-- Rueda derecha: forma_base=circulo | volumen=2D | tamaño=chico | ubicacion=abajo a la derecha de la carroceria | contacto=simetrica_a:Rueda izquierda
+silla:
+Usa primitivas angulares simples: un rectángulo para el asiento, uno para el respaldo, y 4
+cilindros finos idénticos para las patas, simétricas de a pares.
+
+"""
+
+def expandir_prompt(descripcion: str) -> str:
+    """Paso -1. Devuelve una guía corta de técnica de dibujo para `descripcion`,
+    o la `descripcion` original sin cambios si el modelo no responde (nunca
+    bloquea el pipeline — mismo criterio de "nunca None en cadena" del resto
+    del proyecto). Cacheado en disco por descripción (PROMPT_CACHE_DIR): la
+    misma palabra corta ("avión") siempre da la misma guía, no hace falta
+    volver a pensarla cada vez que alguien pide otro avión."""
+    cacheado = _cargar_cache_prompt(descripcion)
+    if cacheado:
+        print(f"[paso -1] Guía cacheada para '{descripcion}': {cacheado}")
+        return cacheado
+
+    import modelos
+    texto = modelos.llamar(
+        "expansor_prompt",
+        user_content=descripcion,
+    )
+    if not texto:
+        print("[paso -1] El modelo no respondió; se continúa con la descripción original sin guía.")
+        return descripcion
+
+    guia = _limpiar_preambulo_conversacional(texto.strip().strip('"').strip())
+    if not guia:
+        return descripcion
+
+    _guardar_cache_prompt(descripcion, guia)
+    return guia
+
+
+SYSTEM_DESCRIPCION_FISICA_BASE = """Describís objetos del mundo real en términos de sus partes geométricas
+básicas. NO usés coordenadas ni números de posición: solo lenguaje descriptivo.
+PRECISIÓN: todo lo que escribas acá será la fuente de verdad que el paso 1
+usará para asignar coordenadas; si una unión queda ambigua, se notará en el
+resultado final. Concentrate en PARTES ESTRUCTURALES GRANDES y evita detalles
+micro (ojos, nariz, boca, marcos, pomos, antenas, adornos, ventanas sueltas,
+ etc.). Listá SOLO 3 a 5 partes principales: nombre, primitiva entre las
+permitidas, volumen (2D/3D), tamaño relativo, ubicación corta y contacto.
+
+Primitivas permitidas (lista cerrada — NO agregues otras):
+    - 3D: cubo, esfera, cilindro
+    - 2D: circulo, ovalo, cuadrado, rectangulo, triangulo
+    - Puntos libres: cuando necesites trazos libres o siluetas complejas, usa
+        "puntos"/"Puntos" como primitiva y deja que el paso 1 defina los P0/P1.
+
+Formato obligatorio por parte (una línea por parte, separada por " | "):
+    NombreParte: forma_base=<primitiva> | volumen=2D o 3D | tamaño=grande/mediano/chico/muy_chico | ubicacion=<frase corta> | contacto=<ninguna|toca:<lado_propio>=<lado_otra>:<NombreOtraParte>|simetrica_a:<NombreOtraParte>>
+
+Reglas clave:
+    - SOLO 3 a 5 partes principales: cuerpo/torso, cabeza, extremidades, carrocería/paredes/techo, ruedas, etc.
+    - PROHIBIDO listar micro-detalles (ojos, ventanas individuales, marcos, botones, tiradores, antenas) —
+        esos detalles NO se deben descomponer aquí.
+    - "contacto" define UNIÓN exacta: "toca:abajo=arriba:Cuerpo" significa que el borde de abajo
+        debe coincidir exactamente con el borde de arriba de "Cuerpo"; "simetrica_a:X" indica espejo exacto.
+    - Si ninguna primitiva encaja, eligí la más parecida entre las permitidas o usa "puntos" para trazos.
+    - No escribas texto adicional, explicaciones ni markdown; sólo las líneas de partes.
+
+Ejemplo (casa simplificada):
+- Cuerpo: forma_base=cubo | volumen=3D | tamaño=grande | ubicacion=mitad inferior | contacto=ninguna
+- Techo: forma_base=cubo | volumen=3D | tamaño=mediano | ubicacion=encima del cuerpo | contacto=toca:abajo=arriba:Cuerpo
+- Puerta: forma_base=rectangulo | volumen=2D | tamaño=chico | ubicacion=centro inferior del cuerpo | contacto=toca:abajo=abajo:Cuerpo
 """
 
 
 def _system_descripcion_fisica() -> str:
-    """Arma el system prompt del paso 0a con el catálogo de formas base ya
-    embebido, para que la lista de opciones válidas se mantenga sincronizada
-    con figuras_base.json sin tener que tocar este prompt a mano."""
-    return SYSTEM_DESCRIPCION_FISICA_BASE.format(catalogo=_texto_catalogo_para_prompt())
+    """Arma el system prompt del paso 0a. El catálogo externo fue eliminado;
+    las primitivas permitidas y las reglas están embebidas en
+    `SYSTEM_DESCRIPCION_FISICA_BASE` para evitar ambigüedad en modelos locales."""
+    return SYSTEM_DESCRIPCION_FISICA_BASE
 
 
 # ----------------------------------------------------------------------------------
@@ -315,6 +309,16 @@ def _system_descripcion_fisica() -> str:
 # ----------------------------------------------------------------------------------
 
 SYSTEM_FIGURA_RAZONAMIENTO = """Dibujás objetos 3D en un panel. Coordenadas X,Y: (0,0)=arriba izq, (1,1)=abajo der, centrá en (0.5,0.5). Coordenada Z: 0=frente cámara, 1=fondo, 0.5=plano neutro (igual que 2D anterior).
+
+=== MEDIDAS: SIEMPRE LAS DECIDÍS VOS ===
+El catálogo de figuras base (figuras_base.json) es SOLO vocabulario y guía topológica — NO
+contiene coordenadas fijas. Vos decidís TODAS las medidas (cx, cy, ancho, alto, profundo, r,
+etc.) de cada primitiva y la posición exacta de cada punto P. No hay una "plantilla rígida"
+que te ate a una silueta específica: si pedís "casa", podés hacer una casa baja y ancha o
+alta y angosta, vos elegís. El catálogo solo te dice "estas son las formas disponibles
+(cubo, esfera, techo_a_dos_aguas, engranaje, ...)" y, para las formas PUNTOS3D/PUNTOS2D, te
+recuerda cuántos vértices y aristas esperar (ej: techo_a_dos_aguas = 6 vértices, 9 aristas).
+Las coordenadas de esos vértices son tuyas.
 
 === REGLA FUNDAMENTAL ===
 Elegí UNO de estos dos enfoques y aplicalo COMPLETO. NUNCA mezcles:
@@ -330,7 +334,8 @@ Si el objeto (o una parte) es una caja, cubo, bloque, dado o cualquier prisma re
 PROHIBIDO representarlo con puntos Px: y líneas L:. Un modelo chico casi siempre arma mal el
 cierre del contorno y termina dibujando un zigzag en vez de un cubo. Usá SIEMPRE la primitiva
 K: cx,cy,cz,ancho,alto,profundo (ancho=alto=profundo si es un cubo perfecto). Lo mismo aplica
-a un cuadrado o rectángulo chato (sin volumen): usá SIEMPRE R:, nunca 4 puntos sueltos.
+a un cuadrado o rectángulo chato (sin volumen): usá SIEMPRE R:, nunca 4 puntos sueltos. Vos
+elegís los valores numéricos de ancho/alto/profundo/cx/cy/cz — el catálogo ya no te los da.
 
 === REGLA DE UNIÓN EXACTA ENTRE PARTES (esquinas y bordes SIEMPRE coinciden, cero tolerancia) ===
 Recibís, para cada parte, un campo "contacto" (toca:<lado_propio>=<lado_otra>:<Otra>,
@@ -614,6 +619,32 @@ def _limpiar_markdown(texto: str) -> str:
     return texto.strip()
 
 
+_PREFIJOS_CONVERSACIONALES = (
+    "sure", "certainly", "of course", "here's", "here is", "i can help",
+    "i'd be happy", "claro", "por supuesto", "aquí tienes", "aquí está",
+    "acá tenés", "acá está", "a continuación", "guía:", "guia:", "respuesta:",
+    "para dibujar", "voy a", "okay", "ok,", "entendido",
+)
+
+
+def _limpiar_preambulo_conversacional(texto: str) -> str:
+    """Corta la primera línea si el modelo, pese a la instrucción del system
+    prompt, arrancó con una muletilla conversacional en vez de ir directo al
+    contenido pedido (típico de modelos chicos como nemotron-mini/gemma
+    cuando reciben una entrada de 1-2 palabras y "completan" como si fuera un
+    chat normal). Es una red de seguridad barata en Python -- el prompt ya
+    prohíbe esto explícitamente, pero un modelo de 3-4B no lo respeta el
+    100% de las veces, y acá es más barato filtrarlo que reintentar la
+    llamada al modelo."""
+    if not texto:
+        return texto
+    lineas = texto.strip().split("\n")
+    primera = lineas[0].strip().lower()
+    if any(primera.startswith(p) for p in _PREFIJOS_CONVERSACIONALES):
+        lineas = lineas[1:]
+    return "\n".join(lineas).strip()
+
+
 def _parsear_formato_compacto(texto):
     """Parser robusto: extrae puntos, conexiones y primitivas del formato compacto.
 
@@ -850,34 +881,61 @@ def _parsear_formato_compacto(texto):
     return {"puntos": list(puntos_lista), "conexiones": conexiones, "primitivas": primitivas}
 
 
-def _llamar_modelo(messages, num_predict=-1, temperatura=0.2):
-    """Hace una sola consulta al modelo."""
-    try:
+# Lock global de todo el proyecto para llamadas a Ollama. Antes cada módulo
+# nuevo (objetos.py, termodinamica.py, calculo_estructural.py...) tenía que
+# acordarse "a mano" de nunca disparar dos pedidos al modelo en simultáneo
+# (ver el docstring de objetos.crear_objeto). Con más módulos llamando al
+# modelo desde hilos de fondo (ej. el asesor de modos.py, que comenta sobre
+# el estado de la simulación de forma asíncrona), confiar en que cada caller
+# coordine bien ya no alcanza — un solo punto de entrada (acá) es más
+# confiable que repetir la disciplina en cada módulo nuevo. El costo es cero
+# en el caso normal (nunca hay contención real, las llamadas ya eran
+# secuenciales en la práctica); lo que gana es una garantía dura en vez de
+# una convención.
+_LOCK_OLLAMA = threading.Lock()
+
+
+def _llamar_modelo(messages, num_predict=-1, temperatura=0.2, modelo=None, formato=None):
+    """Hace una sola consulta al modelo. Serializada globalmente (ver
+    _LOCK_OLLAMA) para que dos hilos nunca tengan una consulta viva al mismo
+    tiempo, sin importar desde qué módulo se llame.
+
+    `modelo`: tag de Ollama a usar. Si no se pasa, usa el MODELO global (el de
+    siempre, paso 0a/paso 1 de este archivo). Las skills nuevas (ubicación,
+    geometría, materiales, térmico, estructural) pasan su propio modelo vía
+    `modelos.llamar()`, que lee `modelos_config.json` — así cada una puede
+    correr un modelo chico especializado en vez de compartir uno solo.
+    `formato`: si es "json", pide el modo JSON nativo de Ollama (hoy solo lo
+    usa la skill de materiales, emparejado con validación Pydantic en la
+    capa 3 de esa skill)."""
+    modelo_usar = modelo or MODELO
+    opciones = {
+        "temperature": temperatura,
+        "num_predict": num_predict,
+        "num_ctx": 8192,
+    }
+    kwargs_extra = {"format": "json"} if formato == "json" else {}
+    with _LOCK_OLLAMA:
         try:
-            respuesta = ollama.chat(
-                model=MODELO,
-                messages=messages,
-                think=False,
-                options={
-                    "temperature": temperatura,
-                    "num_predict": num_predict,
-                    "num_ctx": 8192
-                },
-            )
-        except TypeError:
-            respuesta = ollama.chat(
-                model=MODELO,
-                messages=messages,
-                options={
-                    "temperature": temperatura,
-                    "num_predict": num_predict,
-                    "num_ctx": 8192
-                },
-            )
-        return respuesta["message"]["content"]
-    except Exception as e:
-        print(f"[IA] No se pudo llamar al modelo: {e}")
-        return None
+            try:
+                respuesta = ollama.chat(
+                    model=modelo_usar,
+                    messages=messages,
+                    think=False,
+                    options=opciones,
+                    **kwargs_extra,
+                )
+            except TypeError:
+                respuesta = ollama.chat(
+                    model=modelo_usar,
+                    messages=messages,
+                    options=opciones,
+                    **kwargs_extra,
+                )
+            return respuesta["message"]["content"]
+        except Exception as e:
+            print(f"[IA] No se pudo llamar al modelo '{modelo_usar}': {e}")
+            return None
 
 
 def _generar_descripcion_fisica(descripcion):
@@ -890,17 +948,17 @@ def _generar_descripcion_fisica(descripcion):
     Devuelve el texto de la descripción, o None si el modelo no respondió (en ese caso
     el pipeline sigue funcionando igual, solo que sin este contexto extra).
     """
-    texto = _llamar_modelo(
-        messages=[
-            {"role": "system", "content": _system_descripcion_fisica()},
-            {"role": "user", "content": descripcion},
-        ],
-        num_predict=-1,
-        temperatura=0.3,
+    # Skill "dibujo_paso0a_razonamiento" en modelos_config.json (por defecto
+    # deepseek-r1:7b): es la parte de razonamiento libre/desglose lógico, así
+    # que usa un modelo distinto al de generación de coordenadas (paso 1).
+    import modelos
+    texto = modelos.llamar(
+        "dibujo_paso0a_razonamiento",
+        user_content=descripcion,
     )
     if not texto:
         return None
-    return _limpiar_markdown(texto)
+    return _limpiar_preambulo_conversacional(_limpiar_markdown(texto))
 
 
 # ---------------------------------------------------------------------------
@@ -1072,172 +1130,25 @@ def _dims_a_texto(dims: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Ensamblado determinístico por catálogo — el corazón del fix del bug del cubo.
+# NOTA HISTÓRICA sobre el modo catálogo:
 #
-# En vez de pedirle al LLM que "razone" coordenadas para partes cuya forma ya
-# está resuelta en el catálogo (cubo, esfera, cilindro, etc.), esta función:
-#   1) Lee de la descripción física qué forma_base eligió el modelo para cada parte.
-#   2) Si esa forma_base está en el catálogo Y la parte tiene un bbox asignado
-#      (paso 0b), construye la primitiva o el conjunto de puntos/líneas
-#      DIRECTAMENTE en Python, escalando la plantilla unitaria al tamaño del bbox.
-#   3) Si TODAS las partes se pudieron resolver así, la figura queda 100% armada
-#      sin haber llamado al LLM para geometría ni una sola vez — cero riesgo de
-#      que invente un cubo mal cerrado.
-#   4) Si alguna parte no está en el catálogo (forma rara, objeto no contemplado)
-#      se devuelve None y el pipeline sigue con el LLM como antes (paso 1),
-#      que igual ahora tiene el catálogo mencionado en su propio prompt.
-# ---------------------------------------------------------------------------
-
-_PATRON_PARTE_FISICA = re.compile(
-    r"^-?\s*([^:]+):\s*forma_base\s*=\s*([a-záéíóúñ_]+)", re.IGNORECASE
-)
-
-
-def _extraer_partes_fisicas(descripcion_fisica: str) -> list[dict]:
-    """Parsea las líneas del paso 0a con el formato
-    '- NombreParte: forma_base=X | volumen=... | ...' y devuelve
-    [{"nombre": "Cuerpo", "forma_base": "cubo"}, ...]. Ignora líneas que no
-    matcheen ese formato (ej. si el modelo no siguió el formato pedido)."""
-    partes = []
-    if not descripcion_fisica:
-        return partes
-    for linea in descripcion_fisica.splitlines():
-        m = _PATRON_PARTE_FISICA.match(linea.strip())
-        if m:
-            partes.append({
-                "nombre": m.group(1).strip(),
-                "forma_base": m.group(2).strip(),
-            })
-    return partes
-
-
-def _construir_pieza_catalogo(defin: dict, categoria: str, bbox: dict) -> dict:
-    """Escala la plantilla unitaria de una forma base al tamaño y posición del
-    bbox asignado, y arma la primitiva o el bloque de puntos+líneas en el mismo
-    formato que produce el parser del LLM (ver `_parsear_formato_compacto`).
-
-    Devuelve un dict con al menos una de estas dos formas:
-        {"primitiva": {...}}                          — para C/R/E/S/Y/K
-        {"puntos": [...], "conexiones": [...]}         — para PUNTOS2D/PUNTOS3D
-    """
-    cx = (bbox["x_min"] + bbox["x_max"]) / 2.0
-    cy = (bbox["y_min"] + bbox["y_max"]) / 2.0
-    ancho = bbox["x_max"] - bbox["x_min"]
-    alto = bbox["y_max"] - bbox["y_min"]
-    # Sin info de profundidad explícita: se usa el promedio de ancho/alto,
-    # que da un volumen proporcionado en vez de aplanado o estirado al azar.
-    profundo = (ancho + alto) / 2.0
-    cz = 0.5
-
-    primitiva_tipo = defin.get("primitiva")
-
-    if primitiva_tipo == "K":  # cubo / caja
-        if defin.get("cara_cuadrada"):
-            lado = min(ancho, alto)
-            ancho = alto = lado
-        return {"primitiva": {
-            "tipo": "cubo", "cx": cx, "cy": cy, "cz": cz,
-            "ancho": ancho, "alto": alto, "profundo": profundo,
-        }}
-
-    if primitiva_tipo == "S":  # esfera
-        r = min(ancho, alto) / 2.0
-        return {"primitiva": {"tipo": "esfera", "cx": cx, "cy": cy, "cz": cz, "r": r}}
-
-    if primitiva_tipo == "Y":  # cilindro
-        r = min(ancho, alto) / 2.0 if ancho < alto else ancho / 2.0
-        return {"primitiva": {"tipo": "cilindro", "cx": cx, "cy": cy, "cz": cz, "r": r, "alto": alto}}
-
-    if primitiva_tipo == "C":  # círculo
-        r = min(ancho, alto) / 2.0
-        return {"primitiva": {"tipo": "circulo", "cx": cx, "cy": cy, "r": r, "cz": cz}}
-
-    if primitiva_tipo == "E":  # elipse
-        return {"primitiva": {"tipo": "elipse", "cx": cx, "cy": cy, "rx": ancho/2.0, "ry": alto/2.0, "cz": cz}}
-
-    if primitiva_tipo == "R":  # rectángulo / cuadrado
-        if defin.get("cara_cuadrada"):
-            lado = min(ancho, alto)
-            ancho = alto = lado
-        return {"primitiva": {
-            "tipo": "rectangulo", "x": cx - ancho/2.0, "y": cy - alto/2.0,
-            "ancho": ancho, "alto": alto, "cz": cz,
-        }}
-
-    if primitiva_tipo in ("PUNTOS2D", "PUNTOS3D"):
-        plantilla = defin.get("plantilla_puntos", [])
-        conexiones = [list(c) for c in defin.get("plantilla_conexiones", [])]
-        puntos = []
-        for p in plantilla:
-            px = cx + p[0] * ancho
-            py = cy + p[1] * alto
-            if primitiva_tipo == "PUNTOS3D" and len(p) > 2:
-                pz = cz + p[2] * profundo
-                puntos.append((
-                    min(max(px, 0.0), 1.0),
-                    min(max(py, 0.0), 1.0),
-                    min(max(pz, 0.0), 1.0),
-                ))
-            else:
-                puntos.append((min(max(px, 0.0), 1.0), min(max(py, 0.0), 1.0)))
-        return {"puntos": puntos, "conexiones": conexiones}
-
-    return {}
-
-
-def _ensamblar_figura_por_catalogo(descripcion_fisica: str, dims: dict) -> dict | None:
-    """Intenta armar la figura COMPLETA usando solo el catálogo (sin LLM para
-    geometría). Devuelve None si alguna parte no se pudo resolver (forma_base
-    desconocida o sin bbox asignado), para que el pipeline caiga al flujo con
-    LLM como red de seguridad."""
-    partes = _extraer_partes_fisicas(descripcion_fisica)
-    if not partes:
-        return None
-
-    puntos_totales: list = []
-    conexiones_totales: list = []
-    primitivas_totales: list = []
-
-    for parte in partes:
-        rol = _rol_de_parte(parte["nombre"])
-        bbox = dims.get(rol) if rol else None
-        if bbox is None:
-            # Parte sin bbox asignado (rol desconocido para el paso 0b):
-            # no hay forma confiable de posicionarla en código, así que se
-            # aborta el ensamblado por catálogo y se cae al LLM para TODA
-            # la figura (más seguro que mezclar piezas ya ubicadas con
-            # piezas "libres").
-            return None
-
-        resuelto = _resolver_forma_base(parte["forma_base"])
-        if resuelto is None:
-            return None
-        _clave, categoria, defin = resuelto
-
-        pieza = _construir_pieza_catalogo(defin, categoria, bbox)
-        if not pieza:
-            return None
-
-        if "primitiva" in pieza:
-            primitivas_totales.append(pieza["primitiva"])
-        elif "puntos" in pieza:
-            offset = len(puntos_totales)
-            puntos_totales.extend(pieza["puntos"])
-            for i, j in pieza["conexiones"]:
-                conexiones_totales.append([i + offset, j + offset])
-        else:
-            return None
-
-    if not puntos_totales and not primitivas_totales:
-        return None
-
-    return {
-        "puntos": puntos_totales,
-        "conexiones": conexiones_totales,
-        "primitivas": primitivas_totales,
-    }
-
-
+# Antes de la reescritura, este módulo tenía un "modo catálogo" que
+# ensamblaba la figura EN PYTHON (sin LLM) escalando plantillas con
+# coordenadas fijas a bboxes hardcodeados. Ese modo se eliminó por dos
+# problemas concretos que generaba:
+#   1) La casa (cualquier casa) salía con la misma silueta SIEMPRE: el
+#      techo_a_dos_aguas tenía 6 vértices en coords fijas en [-0.5, 0.5] y
+#      se escalaba al bbox del techo, pero ese bbox era idéntico en cada
+#      llamada → misma geometría bit a bit.
+#   2) Los 6 vértices del prisma-techo se cruzaban con los 8 del cubo-cuerpo
+#      porque compartían la misma zona x, generando ramificación y
+#      auto-intersección en `geometria.auditar_geometria`.
+#
+# Ahora el catálogo es solo VOCABULARIO (lista cerrada de claves válidas
+# para el LLM en el paso 0a, plantillas_topologicas simbólicas para guía
+# estructural del paso 1). Las medidas las decide SIEMPRE el modelo y las
+# valida `geometria.py` después. Ver el comentario al inicio de
+# `figuras_base.json` para el detalle.
 # ---------------------------------------------------------------------------
 # Paso 2b — Validación de bboxes
 #
@@ -1657,41 +1568,53 @@ def _normalizar_figura(datos) -> dict:
                 base["cz"] = min(max(float(prim["cz"]), 0.0), 1.0)
 
             if tipo == "circulo":
-                primitivas.append({
+                prim_data = {
                     "tipo": "circulo",
                     "cx": min(max(float(prim["cx"]), 0.0), 1.0),
                     "cy": min(max(float(prim["cy"]), 0.0), 1.0),
                     "r":  min(max(float(prim["r"]),  0.0), 1.0),
                     **base,
-                })
+                }
+                if "color" in prim:
+                    prim_data["color"] = prim["color"]
+                primitivas.append(prim_data)
             elif tipo == "rectangulo":
-                primitivas.append({
+                prim_data = {
                     "tipo":  "rectangulo",
                     "x":     min(max(float(prim["x"]),     0.0), 1.0),
                     "y":     min(max(float(prim["y"]),     0.0), 1.0),
                     "ancho": min(max(float(prim["ancho"]), 0.0), 1.0),
                     "alto":  min(max(float(prim["alto"]),  0.0), 1.0),
                     **base,
-                })
+                }
+                if "color" in prim:
+                    prim_data["color"] = prim["color"]
+                primitivas.append(prim_data)
             elif tipo == "elipse":
-                primitivas.append({
+                prim_data = {
                     "tipo": "elipse",
                     "cx": min(max(float(prim["cx"]), 0.0), 1.0),
                     "cy": min(max(float(prim["cy"]), 0.0), 1.0),
                     "rx": min(max(float(prim["rx"]), 0.0), 1.0),
                     "ry": min(max(float(prim["ry"]), 0.0), 1.0),
                     **base,
-                })
+                }
+                if "color" in prim:
+                    prim_data["color"] = prim["color"]
+                primitivas.append(prim_data)
             elif tipo == "esfera":
-                primitivas.append({
+                prim_data = {
                     "tipo": "esfera",
                     "cx": min(max(float(prim["cx"]), 0.0), 1.0),
                     "cy": min(max(float(prim["cy"]), 0.0), 1.0),
                     "cz": min(max(float(prim.get("cz", 0.5)), 0.0), 1.0),
                     "r":  min(max(float(prim["r"]),  0.0), 1.0),
-                })
+                }
+                if "color" in prim:
+                    prim_data["color"] = prim["color"]
+                primitivas.append(prim_data)
             elif tipo == "cubo":
-                primitivas.append({
+                prim_data = {
                     "tipo":    "cubo",
                     "cx":      min(max(float(prim["cx"]),      0.0), 1.0),
                     "cy":      min(max(float(prim["cy"]),      0.0), 1.0),
@@ -1699,16 +1622,22 @@ def _normalizar_figura(datos) -> dict:
                     "ancho":   min(max(float(prim["ancho"]),   0.0), 1.0),
                     "alto":    min(max(float(prim["alto"]),    0.0), 1.0),
                     "profundo":min(max(float(prim.get("profundo", prim["ancho"])), 0.0), 1.0),
-                })
+                }
+                if "color" in prim:
+                    prim_data["color"] = prim["color"]
+                primitivas.append(prim_data)
             elif tipo == "cilindro":
-                primitivas.append({
+                prim_data = {
                     "tipo": "cilindro",
                     "cx":   min(max(float(prim["cx"]),   0.0), 1.0),
                     "cy":   min(max(float(prim["cy"]),   0.0), 1.0),
                     "cz":   min(max(float(prim.get("cz", 0.5)), 0.0), 1.0),
                     "r":    min(max(float(prim["r"]),    0.0), 1.0),
                     "alto": min(max(float(prim["alto"]), 0.0), 1.0),
-                })
+                }
+                if "color" in prim:
+                    prim_data["color"] = prim["color"]
+                primitivas.append(prim_data)
         except (KeyError, ValueError, TypeError):
             pass  # primitiva malformada, se descarta
 
@@ -1724,8 +1653,11 @@ def generar_figura(descripcion):
                               reconocida y las inyecta en el prompt del paso 1.
                               Esto le da al modelo restricciones concretas de posición
                               y tamaño, en vez de dejarle inventar proporciones libres.
-    Paso 1  — GENERADOR:     produce el esquema compacto (P/L/C/R/E) con las
-                              dimensiones del paso 0b como restricción explícita.
+    Paso 1  — GENERADOR:     produce el esquema compacto (P/L/C/R/E/S/Y/K) con las
+                              dimensiones del paso 0b como restricción. LAS MEDIDAS
+                              LAS DECIDE EL LLM (antes había un "modo catálogo" que
+                              las fijaba en código; se eliminó porque producía siempre
+                              la misma silueta para un mismo objeto).
     Paso 2a — CORRECTOR:     si el paso 1 generó puntos sueltos con primitivas
                               (señal de confusión), pide un segundo intento enfocado.
     Paso 2b — VALIDADOR BBOX: verifica que cada elemento respete su bounding-box.
@@ -1752,9 +1684,28 @@ def generar_figura(descripcion):
 
     figura = None
 
+    # ── PASO -1: Expansor de prompt ────────────────────────────────────────
+    # Entrada típica acá: 2-4 palabras ("avión", "auto rojo ferrari"). Antes
+    # de pedirle al modelo que liste partes (paso 0a) o genere coordenadas
+    # (paso 1), se le pide una guía corta de TÉCNICA (qué primitivas usar,
+    # qué simetría respetar, qué rasgo no perder) — un salto mucho más chico
+    # para un modelo de 4B que "de la palabra 'oso' a coordenadas exactas".
+    # `descripcion` (la original, sin tocar) sigue siendo la clave de caché
+    # de la FIGURA completa y el nombre del objeto en objetos_db.json — la
+    # guía solo enriquece lo que se manda al modelo internamente, nunca la
+    # identidad del objeto.
+    print("[paso -1] Generando guía de técnica de dibujo...")
+    guia_tecnica = expandir_prompt(descripcion)
+    if guia_tecnica.strip() and guia_tecnica.strip() != descripcion.strip():
+        print(f"[paso -1] Guía: {guia_tecnica}\n")
+        descripcion_ia = f"{descripcion}\n\nGuía de técnica de dibujo: {guia_tecnica}"
+    else:
+        print("[paso -1] Sin guía adicional (modelo no respondió); se continúa con la descripción original.\n")
+        descripcion_ia = descripcion
+
     # ── PASO 0a: Descriptor físico ─────────────────────────────────────────
     print("[paso 0a] Describiendo partes físicas del objeto...")
-    descripcion_fisica = _generar_descripcion_fisica(descripcion)
+    descripcion_fisica = _generar_descripcion_fisica(descripcion_ia)
     if descripcion_fisica:
         print(f"[paso 0a] Descripción física recibida:\n{descripcion_fisica}\n")
     else:
@@ -1773,31 +1724,18 @@ def generar_figura(descripcion):
         else:
             print("[paso 0b] No se reconocieron partes con reglas de dimensionamiento.")
 
-    # ── PASO 1-CATÁLOGO: ensamblado determinístico (sin LLM) ───────────────
-    # Si todas las partes de la descripción física resuelven a una forma del
-    # catálogo con bbox asignado, la geometría se arma en código y nos
-    # ahorramos por completo el paso 1 del LLM (y con él, el bug del cubo).
-    if descripcion_fisica and dims:
-        figura_catalogo = _ensamblar_figura_por_catalogo(descripcion_fisica, dims)
-        if figura_catalogo and _validar_figura(figura_catalogo):
-            n_p  = len(figura_catalogo['puntos'])
-            n_c  = len(figura_catalogo['conexiones'])
-            n_pr = len(figura_catalogo.get('primitivas', []))
-            print(
-                f"[paso 1-catálogo] ✓ Figura ensamblada 100% por catálogo "
-                f"(sin LLM): {n_p} puntos, {n_c} conexiones, {n_pr} primitivas."
-            )
-            print(f"[IA] ✓ Pipeline exitoso (catálogo): {n_p} puntos, {n_c} conexiones, {n_pr} primitivas.")
-            print(f"{'='*60}\n")
-            _guardar_cache(descripcion, figura_catalogo)
-            return figura_catalogo
-        else:
-            print("[paso 1-catálogo] Ensamblado incompleto (forma o parte fuera del catálogo); usando LLM.")
+    # ── PASO 1: LLM genera coordenadas ─────────────────────────────────────
+    # Antes existía un "modo catálogo" que ensamblaba la figura en Python
+    # sin llamar al LLM. Se eliminó: generaba la misma silueta para todos los
+    # objetos del mismo tipo (casa=casa, auto=auto, ...) porque escalaba
+    # plantillas con coordenadas fijas a bboxes hardcodeados. Ahora el LLM
+    # del paso 1 SIEMPRE genera las medidas, y `geometria.py` valida el
+    # resultado. Ver la nota histórica al inicio de este archivo.
 
     # ── Construcción del prompt para el paso 1 ─────────────────────────────
     if descripcion_fisica:
         contenido_paso1 = (
-            f"{descripcion}\n\n"
+            f"{descripcion_ia}\n\n"
             f"Descripción física de referencia (partes, forma, tamaño y ubicación relativa):\n"
             f"{descripcion_fisica}\n\n"
         )
@@ -1821,17 +1759,17 @@ def generar_figura(descripcion):
             f"uno en su propia línea, NUNCA todos los puntos juntos en una sola línea ni con 'Px:'."
         )
     else:
-        contenido_paso1 = descripcion
+        contenido_paso1 = descripcion_ia
 
     # ── PASO 1: Generador ─────────────────────────────────────────────────
     print("[paso 1] Generando esquema...")
-    esquema = _llamar_modelo(
-        messages=[
-            {"role": "system", "content": SYSTEM_FIGURA_RAZONAMIENTO},
-            {"role": "user", "content": contenido_paso1},
-        ],
-        num_predict=-1,
-        temperatura=0.25,
+    # Skill "dibujo_paso1_coordenadas" en modelos_config.json (por defecto
+    # gemma4:e4b): generación de coordenadas/primitivas en formato estricto,
+    # modelo distinto al de razonamiento del paso 0a.
+    import modelos
+    esquema = modelos.llamar(
+        "dibujo_paso1_coordenadas",
+        user_content=contenido_paso1,
     )
 
     if not esquema:
@@ -1883,24 +1821,22 @@ def generar_figura(descripcion):
             f"\n\n{texto_dims}"
             if texto_dims else ""
         )
-        esquema2 = _llamar_modelo(
-            messages=[
-                {"role": "system", "content": SYSTEM_FIGURA_RAZONAMIENTO},
-                {
-                    "role": "user",
-                    "content": (
-                        f"{descripcion}\n\n"
-                        f"IMPORTANTE: el primer intento mezcló puntos sueltos con círculos y quedó mal.\n"
-                        f"Esta vez elegí UNO de los dos enfoques y aplicalo completo:\n"
-                        f"  OPCIÓN A (recomendada para objetos redondos): escribí L: vacío y usá solo C:/R:/E:\n"
-                        f"  OPCIÓN B (para siluetas angulares): definí todos los puntos y conectalos con L:\n"
-                        f"NO mezcles puntos sueltos sin conexión con primitivas."
-                        f"{contexto_fisico}"
-                        f"{contexto_dims}"
-                    ),
-                },
-            ],
-            num_predict=-1,
+        # Mismo modelo que el paso 1 (skill "dibujo_paso1_coordenadas"): es un
+        # reintento de la misma tarea de generación de coordenadas, no un paso
+        # distinto, así que comparte modelo — solo baja la temperatura para el
+        # reintento (más determinístico que el intento original).
+        esquema2 = modelos.llamar(
+            "dibujo_paso1_coordenadas",
+            user_content=(
+                f"{descripcion_ia}\n\n"
+                f"IMPORTANTE: el primer intento mezcló puntos sueltos con círculos y quedó mal.\n"
+                f"Esta vez elegí UNO de los dos enfoques y aplicalo completo:\n"
+                f"  OPCIÓN A (recomendada para objetos redondos): escribí L: vacío y usá solo C:/R:/E:\n"
+                f"  OPCIÓN B (para siluetas angulares): definí todos los puntos y conectalos con L:\n"
+                f"NO mezcles puntos sueltos sin conexión con primitivas."
+                f"{contexto_fisico}"
+                f"{contexto_dims}"
+            ),
             temperatura=0.15,
         )
 
@@ -1961,12 +1897,11 @@ def generar_figura(descripcion):
                 f"NUNCA todos juntos en una línea."
             )
 
-            esquema_r = _llamar_modelo(
-                messages=[
-                    {"role": "system", "content": SYSTEM_FIGURA_RAZONAMIENTO},
-                    {"role": "user", "content": contenido_reintento},
-                ],
-                num_predict=-1,
+            # Mismo criterio que el reintento del paso 2a: sigue siendo la skill
+            # "dibujo_paso1_coordenadas", solo con temperatura fija más baja.
+            esquema_r = modelos.llamar(
+                "dibujo_paso1_coordenadas",
+                user_content=contenido_reintento,
                 temperatura=0.10,   # temperatura muy baja: queremos precisión, no creatividad
             )
 
@@ -2058,12 +1993,10 @@ class InterpreteGestos:
         threading.Thread(target=self._consultar, args=(datos,), daemon=True).start()
 
     def _consultar(self, datos):
-        contenido = _llamar_modelo(
-            messages=[
-                {"role": "system", "content": SYSTEM_GESTO},
-                {"role": "user", "content": json.dumps(datos, ensure_ascii=False)},
-            ],
-            num_predict=-1,
+        import modelos
+        contenido = modelos.llamar(
+            "gesto_color",
+            user_content=json.dumps(datos, ensure_ascii=False),
         )
 
         resultado = _extraer_json(contenido)

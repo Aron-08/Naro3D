@@ -32,12 +32,13 @@ configurado).
 import math
 import re
 
-from ia_interprete import _llamar_modelo   # reutiliza el wrapper de Ollama ya probado
+import modelos   # modelo/temperatura de esta skill vienen de modelos_config.json ("calculo_estructural")
 import geometria as geo                    # área/perímetro exactos de la sección (skill 02)
 from ubicacion import calcular_bbox        # bbox real de la figura (skill 01)
 
 
-TEMPERATURA_ESTRUCTURAL = 0.15   # baja: esta skill decide criterio, no crea contenido
+# La temperatura y el modelo de esta skill ahora se controlan desde
+# modelos_config.json (bloque "calculo_estructural"), no acá.
 
 _PALABRAS_CARGA_CICLICA = ("repetid", "vibrac", "ciclic", "cíclic", "fatiga", "alternante")
 
@@ -281,6 +282,43 @@ def _calcular(formula: str, geometria: dict, material: dict, carga: dict) -> dic
 
 
 # ---------------------------------------------------------------------------
+# Recálculo en vivo (modos.py — skill de "modos de uso" en tiempo real)
+# ---------------------------------------------------------------------------
+# evaluar_carga() de abajo llama al LLM una vez por invocación (_decidir_criterio),
+# lo cual está bien para un cálculo puntual pero es inadmisible si algo lo llama
+# 30 veces por segundo desde un modo interactivo (ver modo_electrico/estructural/
+# termico en modos.py). Esta función es el "mismo cálculo pero sin preguntarle
+# nada al modelo": reutiliza una clasificación (formula/resistencia_referencia)
+# YA DECIDIDA una vez (típicamente al entrar al modo, con evaluar_carga()) y
+# solo repite la aritmética con una carga nueva. 100% Python, costo despreciable,
+# seguro de llamar en cada tick de un loop de simulación.
+
+def recalcular_carga(formula: str, resistencia_referencia_mpa: float,
+                      geometria: dict, material: dict, carga: dict) -> dict:
+    """Reevalúa tensión/FS/deflexión/pandeo para una `carga` nueva, sin tocar
+    el LLM — usa una `formula` y `resistencia_referencia_mpa` ya decididas
+    (por ejemplo, la salida de una llamada anterior a evaluar_carga()).
+
+    Devuelve el mismo shape de campos numéricos que evaluar_carga() salvo
+    "nota"/"advertencias" de texto LLM (esos quedan vacíos acá a propósito:
+    esta función es de uso interno de un loop de tiempo real).
+    """
+    calculo = _calcular(formula, geometria, material, carga)
+    fs = factor_seguridad(resistencia_referencia_mpa, calculo["sigma_pa"])
+    return {
+        "formula": formula,
+        "resistencia_referencia_mpa": resistencia_referencia_mpa,
+        "sigma_mpa": calculo["sigma_pa"] / 1e6,
+        "factor_seguridad": fs,
+        "aguanta": fs >= 1.0,
+        "margen_bajo": fs < 1.5,
+        "deflexion_m": calculo.get("deflexion_m"),
+        "pandea": calculo.get("pandea"),
+        "carga_critica_pandeo_n": calculo.get("carga_critica_n"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Razonamiento guiado (única parte con LLM) — elegir criterio, no calcular
 # ---------------------------------------------------------------------------
 
@@ -371,13 +409,12 @@ def _decidir_criterio(geometria: dict, material: dict, carga: dict) -> dict:
         f'"magnitud_n": {carga.get("magnitud_n", 0)}, '
         f'"posicion_relativa": {carga.get("posicion_relativa", 0.5)}}}}}'
     )
-    texto = _llamar_modelo(
+    texto = modelos.llamar(
+        "calculo_estructural",
         messages=[
             {"role": "system", "content": SYSTEM_ESTRUCTURAL},
             {"role": "user", "content": f"entrada: {resumen}"},
         ],
-        num_predict=-1,
-        temperatura=TEMPERATURA_ESTRUCTURAL,
     )
     return _parsear_respuesta_estructural(texto)
 

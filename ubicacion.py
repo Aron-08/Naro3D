@@ -28,7 +28,7 @@ wrapper _llamar_modelo, no se abre una conexión nueva).
 import math
 import re
 
-from ia_interprete import _llamar_modelo   # reutiliza el wrapper de Ollama ya probado
+import modelos   # modelo/temperatura de esta skill vienen de modelos_config.json ("ubicacion_espacial")
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +40,8 @@ TOLERANCIA_MARGEN   = 0.02   # por debajo de esto se considera "violación leve"
 MARGEN_CAMARA       = 0.03   # margen antes del borde del panel [0,1] para no salir de cámara
 PISO_Y              = 0.82   # nivel por defecto de "apoyo" (estante virtual) cuando no hay referencia
 MAX_ITER_COLISION   = 12     # tope de iteraciones al resolver colisiones múltiples
-TEMPERATURA_UBICACION = 0.15  # baja: esta skill decide intención, no crea contenido
+# La temperatura y el modelo de esta skill ahora se controlan desde
+# modelos_config.json (bloque "ubicacion_espacial"), no acá.
 
 
 # ---------------------------------------------------------------------------
@@ -396,13 +397,12 @@ def _interpretar_pedido(pedido_usuario: str, nombre_nuevo: str, objetos: list) -
         f'"objetos_en_escena": {nombres_disponibles}, '
         f'"pedido": "{pedido_usuario}"}}'
     )
-    texto = _llamar_modelo(
+    texto = modelos.llamar(
+        "ubicacion_espacial",
         messages=[
             {"role": "system", "content": SYSTEM_UBICACION},
             {"role": "user", "content": contenido},
         ],
-        num_predict=-1,
-        temperatura=TEMPERATURA_UBICACION,
     )
     interpretacion = _parsear_respuesta_ubicacion(texto)
 

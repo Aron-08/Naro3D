@@ -26,7 +26,7 @@ wireframes casi planos; ver nota en ubicacion.py sobre el mismo tema).
 
 import math
 
-from ia_interprete import _llamar_modelo   # reutiliza el wrapper de Ollama ya probado
+import modelos   # modelo/temperatura de esta skill vienen de modelos_config.json ("geometria")
 from geo_utils import segmentos_cruzan as _segmentos_cruzan  # test de cruce: única
                                                                # implementación, ver geo_utils.py
 
@@ -37,7 +37,8 @@ from geo_utils import segmentos_cruzan as _segmentos_cruzan  # test de cruce: ú
 
 UMBRAL_CIERRE       = 0.05     # distancia máxima para cerrar automáticamente un contorno abierto
 AREA_MINIMA         = 0.0005   # por debajo de esto, la geometría se considera degenerada (colapsada)
-TEMPERATURA_CLASIF  = 0.15     # baja: clasificar mecanismo es criterio, no creatividad
+# La temperatura y el modelo de esta skill ahora se controlan desde
+# modelos_config.json (bloque "geometria"), no aca.
 
 
 # ---------------------------------------------------------------------------
@@ -471,13 +472,12 @@ def clasificar_mecanismo(figura: dict, reporte: dict | None = None) -> dict:
         f"centroide ({centroide_defecto[0]:.2f},{centroide_defecto[1]:.2f})"
     )
 
-    texto = _llamar_modelo(
+    texto = modelos.llamar(
+        "geometria",
         messages=[
             {"role": "system", "content": SYSTEM_CLASIFICAR_MECANISMO},
             {"role": "user", "content": f"entrada: {resumen}"},
         ],
-        num_predict=-1,
-        temperatura=TEMPERATURA_CLASIF,
     )
     return _parsear_clasificacion(texto, centroide_defecto)
 

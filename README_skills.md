@@ -16,6 +16,21 @@ geometría y las propiedades básicas ya están validadas.
 | `03_skill_ciencia_materiales.md` | Extender la ficha de materiales (Poisson, dilatación térmica, calor específico, fatiga) con chequeo de coherencia | asignar valores realistas por material | validación de rangos (Poisson, fatiga vs. tracción) |
 | `04_skill_termodinamica.md` | Conducción, combustión H₂/O₂, riesgo térmico | elegir modelo térmico y modo de falla | TODA la aritmética (Fourier, calorimetría) |
 | `05_skill_calculo_estructural.md` | Tensión, factor de seguridad, deflexión, pandeo | elegir fórmula y modo de falla dominante | TODA la aritmética (resistencia de materiales) |
+| `06_skill_electrico.md` | Corriente, tensión y potencia en una RED de componentes conectados por contacto | clasificar topología (serie/paralelo/red) y redactar advertencia | TODA el álgebra (análisis nodal, ley de Ohm, I²R) — ni siquiera el criterio hace falta acá |
+
+## Modos de uso en tiempo real (`modos.py`)
+
+Capa de orquestación por encima de las 4 skills numéricas (03 a 06), pensada
+para testeo interactivo: un `Modo` (`ModoEstructural`/`ModoTermico`/
+`ModoElectrico`) se activa sobre un objeto, y cada tick recalcula con la
+entrada de la mano (peso aplicado, cercanía a una fuente de calor, contacto
+entre componentes) sin tocar el LLM — cada skill numérica ya expone (o se le
+agregó) una función de recálculo puro-Python para esto:
+`calculo_estructural.recalcular_carga()`, `termodinamica.paso_integrador_concentrado()`,
+`electrico.resolver_red()`. El LLM solo interviene una vez al entrar al modo
+(elegir criterio) y, de forma asíncrona con histéresis + cooldown + caché
+(`AsesorIA`), para comentar cuando el estado cruza un umbral de verdad — nunca
+en el loop de 30 fps. Ver el docstring de `modos.py` para el detalle.
 
 ## Orden de dependencia
 
