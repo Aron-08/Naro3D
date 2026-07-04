@@ -1,0 +1,5 @@
+descripcion: casa
+puntos: []
+conexiones: []
+primitivas: [{"tipo": "rectangulo", "x": 0.25, "y": 0.42, "ancho": 0.5, "alto": 0.2}, {"tipo": "cubo", "cx": 0.25, "cy": 0.42, "cz": 0.5, "ancho": 0.5, "alto": 0.38, "profundo": 0.18}, {"tipo": "cubo", "cx": 0.25, "cy": 0.2, "cz": 0.5, "ancho": 0.5, "alto": 0.38, "profundo": 0.18}]
+generado: 2026-07-04 15:55:51

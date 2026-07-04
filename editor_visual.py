@@ -15,9 +15,14 @@ Qué hace:
     - Guarda color/escala en una capa separada (editor_visual_estilos.json) para
       NO modificar objetos_db.json ni el prompt que le pide la ficha física al
       modelo — así este módulo se agrega sin tocar un solo archivo existente.
-    - Reutiliza la generación de mallas de entorno_virtual (_malla_cubo,
-      _malla_esfera, etc.) para que la previsualización de las primitivas
-      coincida con lo que se dibuja en el entorno real.
+    - Reutiliza las fábricas de primitivas de malla.py (malla_cubo,
+      malla_esfera, etc. — las mismas que usa render_malla.py en el
+      entorno real) para que la previsualización de las primitivas
+      heredadas coincida con lo que se dibuja en la escena.
+    - Si el objeto ya tiene una Malla real archivada (biblioteca_mallas.py
+      / malla_ia_async.py, ver PLAN_RECONSTRUCCION_MALLAS.md sección 5),
+      la previsualización usa esa geometría (LOD bajo) en vez del
+      wireframe heredado de puntos/primitivas.
 
 Standalone:
     python editor_visual.py
@@ -39,9 +44,7 @@ from tkinter import colorchooser, messagebox, ttk
 
 import objetos as obj
 from ui_thread import en_hilo_ui
-from entorno_virtual import (
-    _malla_anillo, _malla_rectangulo, _malla_esfera, _malla_cubo, _malla_cilindro,
-)
+import malla as malla_mod
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +103,7 @@ def _ajustar_brillo(hexcolor: str, factor: float) -> str:
 
 def color_bgr_para_opencv(nombre: str) -> tuple:
     """Devuelve el color guardado para `nombre` como tupla BGR (uint8-friendly),
-    lista para usarse como color_normal de una Figura3D en entorno_virtual.py.
+    lista para usarse como color_normal de una Figura3D (figura.py).
     Punto de integración opcional: no se usa desde acá adentro."""
     estilo = obtener_estilo(nombre)
     r, g, b = _hex_a_rgb(estilo.get("color_hex", "#22D3EE"))
@@ -167,14 +170,19 @@ def eliminar_estilo(nombre: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Geometría de previsualización: reduce cualquier figura (puntos+conexiones
-# y/o primitivas) a UNA sola lista de vértices + aristas, centrada en el
-# origen y normalizada a una caja de ±1, lista para orbitar en el canvas.
-# Reusa las mismas mallas que dibuja el entorno real (entorno_virtual._malla_*)
-# para que la previsualización sea fiel a lo que se ve en la escena.
+# Geometría de previsualización: reduce cualquier figura (puntos+conexiones,
+# primitivas heredadas y/o Malla real de biblioteca/IA) a UNA sola lista de
+# vértices + aristas, centrada en el origen y normalizada a una caja de ±1,
+# lista para orbitar en el canvas.
+# Reusa las mismas fábricas de malla.py que usa el entorno real (vía
+# render_malla.py) para que la previsualización de primitivas heredadas sea
+# fiel a lo que se ve en la escena. Si el objeto ya tiene una Malla real
+# archivada (biblioteca_mallas.py / malla_ia_async.py, formato de
+# optimizacion_malla.serializar_json), se usa esa en vez del wireframe
+# heredado — ver PLAN_RECONSTRUCCION_MALLAS.md, sección 5.
 # ---------------------------------------------------------------------------
 
-def _figura_a_puntos_aristas(figura: dict) -> tuple:
+def _figura_a_puntos_aristas(figura: dict, malla_real: dict = None) -> tuple:
     puntos = []
     aristas = []
 
@@ -198,34 +206,55 @@ def _figura_a_puntos_aristas(figura: dict) -> tuple:
         try:
             if tipo == "circulo":
                 cx, cy = prim["cx"], prim["cy"]
-                locales, ar = _malla_anillo(prim["r"], prim["r"])
+                m = malla_mod.malla_anillo(prim["r"], prim["r"])
             elif tipo == "elipse":
                 cx, cy = prim["cx"], prim["cy"]
-                locales, ar = _malla_anillo(prim["rx"], prim["ry"])
+                m = malla_mod.malla_anillo(prim["rx"], prim["ry"])
             elif tipo == "rectangulo":
                 cx = prim["x"] + prim["ancho"] / 2.0
                 cy = prim["y"] + prim["alto"] / 2.0
-                locales, ar = _malla_rectangulo(prim["ancho"], prim["alto"])
+                m = malla_mod.malla_rectangulo(prim["ancho"], prim["alto"])
             elif tipo == "esfera":
                 cx, cy = prim["cx"], prim["cy"]
-                locales, ar = _malla_esfera(prim["r"])
+                m = malla_mod.malla_esfera(prim["r"])
             elif tipo == "cubo":
                 cx, cy = prim["cx"], prim["cy"]
-                locales, ar = _malla_cubo(
+                m = malla_mod.malla_cubo(
                     prim["ancho"], prim["alto"], prim.get("profundo", prim["ancho"])
                 )
             elif tipo == "cilindro":
                 cx, cy = prim["cx"], prim["cy"]
-                locales, ar = _malla_cilindro(prim["r"], prim["alto"])
+                m = malla_mod.malla_cilindro(prim["r"], prim["alto"])
             else:
                 continue
         except (KeyError, TypeError):
             continue
 
         offset = len(puntos)
-        for lx, ly, lz in locales:
+        for lx, ly, lz in m.vertices:
             puntos.append((cx + lx, cy + ly, cz + lz))
-        aristas += [(offset + a, offset + b) for a, b in ar]
+        aristas += [(offset + a, offset + b) for a, b in m.aristas]
+
+    # Malla real (biblioteca/IA) — fuente PRINCIPAL de geometría en el
+    # entorno actual (ver biblioteca_mallas.py / malla_ia_async.py). Vive
+    # en el registro AL LADO de "figura" (registro["malla"]), no adentro
+    # — cuando hay HIT de biblioteca, "figura" queda como el bbox
+    # placeholder tipo "esfera" que usó ubicacion.py, y la Malla real de
+    # verdad es esta. LOD bajo alcanza para orbitar a mano en este canvas
+    # 2D y es más liviano que el LOD alto (que en el entorno real solo se
+    # usa con la figura agarrada). Formato: el mismo dict de
+    # optimizacion_malla.serializar_json() ({"lod_bajo": {"v":[...],
+    # "f":[...]}, "lod_alto": ... | None, ...}).
+    if malla_real:
+        datos_lod = malla_real.get("lod_bajo") or malla_real.get("lod_alto")
+        if datos_lod:
+            try:
+                m = malla_mod.Malla.from_dict(datos_lod)
+                offset = len(puntos)
+                puntos += list(m.vertices)
+                aristas += [(offset + a, offset + b) for a, b in m.aristas]
+            except (KeyError, TypeError, ValueError):
+                pass
 
     return puntos, aristas
 
@@ -279,9 +308,10 @@ class VistaPrevia3D(tk.Canvas):
 
     # -- API pública ---------------------------------------------------------
 
-    def cargar(self, nombre: str, figura: dict, color_hex: str, escala_xyz: tuple):
+    def cargar(self, nombre: str, figura: dict, color_hex: str, escala_xyz: tuple,
+               malla_real: dict = None):
         self._nombre = nombre
-        puntos_crudos, self._aristas = _figura_a_puntos_aristas(figura or {})
+        puntos_crudos, self._aristas = _figura_a_puntos_aristas(figura or {}, malla_real)
         self._puntos = _normalizar_para_vista(puntos_crudos)
         self._color = color_hex
         self._escala = escala_xyz
@@ -940,13 +970,23 @@ class EditorVisual:
         self._set_formulario_habilitado(True)
 
         figura = registro.get("figura", {"puntos": [], "conexiones": [], "primitivas": []})
-        self.label_geometria.config(
-            text=(
-                f"Geometría: {len(figura.get('puntos', []))} puntos · "
-                f"{len(figura.get('conexiones', []))} conexiones · "
-                f"{len(figura.get('primitivas', []))} primitivas"
+        malla_real = registro.get("malla")
+        if malla_real:
+            lod_bajo = malla_real.get("lod_bajo") or {}
+            n_vert = len(lod_bajo.get("v", []))
+            n_caras = len(lod_bajo.get("f", []))
+            origen = malla_real.get("origen", "malla")
+            self.label_geometria.config(
+                text=f"Geometría: malla real ({origen}) · {n_vert} vértices · {n_caras} caras"
             )
-        )
+        else:
+            self.label_geometria.config(
+                text=(
+                    f"Geometría: {len(figura.get('puntos', []))} puntos · "
+                    f"{len(figura.get('conexiones', []))} conexiones · "
+                    f"{len(figura.get('primitivas', []))} primitivas"
+                )
+            )
 
         self.estilo_actual = obtener_estilo(nombre)
         self._aplicar_estilo_a_controles(self.estilo_actual)
@@ -957,6 +997,7 @@ class EditorVisual:
             nombre, figura, self.estilo_actual["color_hex"],
             (self.estilo_actual["escala_x"], self.estilo_actual["escala_y"],
              self.estilo_actual["escala_z"]),
+            malla_real,
         )
 
         self._set_estado(f"'{nombre}' — actualizado {registro.get('actualizado', '?')}.")

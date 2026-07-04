@@ -12,7 +12,8 @@
     "format=\"json\" en la llamada); dejar null para las skills que usan el formato",
     "de una línea por dato (P0:, CENTRO:, TIPO:, etc.).",
     "'system': prompt del sistema que se inyecta automáticamente cuando se usa",
-    "modelos.llamar() con el parámetro 'user_content' (ver modelos.py)."
+    "modelos.llamar() con el parámetro 'user_content' (ver modelos.py).",
+    "'embeddings_biblioteca' (biblioteca_mallas.py) es distinta: no pasa por modelos.llamar()/_llamar_modelo (eso es chat-completion), llama directo a ollama.embeddings(model=...). Solo se usa el campo 'modelo'; temperatura/ num_predict/formato/system quedan sin efecto para esta skill, se dejan en null/valor neutro por consistencia con el resto del archivo."
   ],
   "skills": {
     "ubicacion_espacial": {
@@ -144,6 +145,24 @@
       "system": "Tenés la ficha de propiedades físicas de un objeto (JSON) y un pedido del usuario para corregirla, completarla o actualizarla.\n\nDevolvé el JSON COMPLETO actualizado, con las mismas claves que recibiste. Cambiá lo que el pedido indica explícitamente y RECALCULÁ cualquier otro valor relacionado para que la ficha siga siendo físicamente coherente entre sí (ejemplo: si el material pasa de \"acero\" a \"aluminio\", recalculá densidad, resistencias, módulo de elasticidad, punto de fusión y resistividad eléctrica acordes al aluminio real, no solo cambies el nombre del material).\n\nRespondé SOLO con el JSON actualizado, sin texto antes ni después, sin markdown.",
       "descripcion": "Recalcula la ficha básica completa cuando el usuario pide cambiar el material u otra propiedad en lenguaje natural",
       "usado_en": "objetos.py :: actualizar_propiedades"
+    },
+    "composicion_parametrica": {
+      "modelo": "gemma4:e4b",
+      "temperatura_min": 0.2,
+      "temperatura_max": 0.3,
+      "num_predict": -1,
+      "formato": "json",
+      "system": "Descomponés objetos del mundo real en partes geométricas paramétricas. NUNCA generás coordenadas de escena ni posiciones absolutas — solo dimensiones reales en centímetros y relaciones de contacto entre partes.\n\nFormas permitidas (lista cerrada): caja, cilindro, esfera, prisma_triangular, tubo.\n\nRespondé SOLO con un JSON:\n{\"partes\": [{\"nombre\": str, \"forma\": <una de las permitidas>, \"dims_cm\": {...claves según forma...}, \"contacto\": \"toca:<lado>=<lado>:<Parte>\" | \"simetrica_a:<Parte>\" | null}], \"factible\": bool}\n\nSi el objeto no se puede representar razonablemente con estas primitivas (ej. una figura orgánica compleja, un logo, una silueta artística), respondé {\"partes\": [], \"factible\": false} — NO fuerces una aproximación mala.\n\nClaves de dims_cm por forma:\n  caja: ancho, alto, profundo\n  cilindro: radio, alto\n  esfera: radio\n  prisma_triangular: ancho, alto, profundo\n  tubo: radio_externo, radio_interno, alto\n\nReglas de contacto (lados: izquierda|derecha|abajo|arriba|atras|adelante):\n  'toca:abajo=arriba:Cuerpo' = el borde de abajo de esta parte coincide con el de arriba de 'Cuerpo'.\n  'simetrica_a:X' = mismas dimensiones que X, reflejada en el eje horizontal.\n\nUsá valores realistas de tamaño (una silla ronda 45cm de asiento, una puerta 200cm de alto, etc.). El nombre de cada parte debe ser único dentro del objeto, y todo 'contacto' debe referenciar un nombre de parte que también aparezca en la lista 'partes' (nunca inventes un nombre que no definiste).\n\n=== EJEMPLO ===\nentrada: silla de madera\n{\"partes\": [\n  {\"nombre\": \"Asiento\", \"forma\": \"caja\", \"dims_cm\": {\"ancho\": 45, \"alto\": 5, \"profundo\": 45}, \"contacto\": null},\n  {\"nombre\": \"Respaldo\", \"forma\": \"caja\", \"dims_cm\": {\"ancho\": 45, \"alto\": 45, \"profundo\": 5}, \"contacto\": \"toca:abajo=arriba:Asiento\"},\n  {\"nombre\": \"Pata_1\", \"forma\": \"cilindro\", \"dims_cm\": {\"radio\": 2, \"alto\": 45}, \"contacto\": \"toca:arriba=abajo:Asiento\"}\n], \"factible\": true}",
+      "descripcion": "Kernel paramétrico (plan_kernel_parametrico.md) — Paso A: descompone el objeto en Partes con forma+dims_cm+contacto. Reemplaza pasos -1/0a/1 del pipeline viejo cuando 'factible=true'; Python (ensamblador.py) resuelve todo el álgebra de contacto/simetría.",
+      "usado_en": "objetos.py :: generar_geometria_parametrica"
+    },
+    "embeddings_biblioteca": {
+      "modelo": "nomic-embed-text",
+      "temperatura_min": 0.0,
+      "temperatura_max": 0.0,
+      "num_predict": -1,
+      "formato": null,
+      "system": null
     }
   }
 }

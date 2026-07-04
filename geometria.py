@@ -351,11 +351,56 @@ def auditar_geometria(figura: dict, uso_destino: str = "render_only") -> dict:
 # Filtro de ruido / validación final (capa 3, ver skill 00)
 # ---------------------------------------------------------------------------
 
-def validar_y_corregir_geometria(figura: dict, uso_destino: str = "render_only") -> tuple[dict, bool, list[str]]:
+def validar_y_corregir_geometria(figura: dict, uso_destino: str = "render_only",
+                                  solo_diagnostico: bool = False) -> tuple[dict, bool, list[str]]:
     """Devuelve (figura_corregida, es_valida, advertencias).
     `figura_corregida` solo difiere de `figura` en `conexiones` (por el
     auto-cierre); nunca se tocan `puntos` ni `primitivas` — esta skill no
-    inventa coordenadas nuevas, solo cierra huecos triviales."""
+    inventa coordenadas nuevas, solo cierra huecos triviales.
+
+    `solo_diagnostico=True` (ver plan_kernel_parametrico.md, sección 8.1):
+    para geometría que ya nació correcta por construcción (kernel
+    paramétrico, `ensamblador.py`), esta función deja de actuar como
+    corrector activo y pasa a ser una red de seguridad de solo lectura —
+    loguea cualquier violación encontrada (señal de un bug real en
+    `_anclar_contacto` o similar, no de un modelo chico alucinando
+    coordenadas) pero NUNCA modifica `conexiones` ni cierra nada
+    automáticamente. `figura_corregida` es entonces una copia idéntica de
+    `figura`, y `es_valida` refleja el resultado crudo de la auditoría sin
+    intento de reparación previo."""
+    if solo_diagnostico:
+        reporte = auditar_geometria(figura, uso_destino)
+        advertencias = []
+        if reporte["colgantes"]:
+            advertencias.append(
+                f"  [diagnóstico] Puntos colgantes: {reporte['colgantes']} — inesperado en "
+                f"geometría paramétrica, revisar ensamblador.py"
+            )
+        if reporte["ramificados"]:
+            advertencias.append(
+                f"  [diagnóstico] Puntos ramificados: {reporte['ramificados']} — inesperado en "
+                f"geometría paramétrica, revisar ensamblador.py"
+            )
+        if reporte["aislados"]:
+            advertencias.append(
+                f"  [diagnóstico] Puntos aislados: {reporte['aislados']} — inesperado en "
+                f"geometría paramétrica, revisar ensamblador.py"
+            )
+        if reporte["auto_interseccion"]:
+            advertencias.append(
+                f"  [diagnóstico] Auto-intersección en aristas {reporte['cruces']} — inesperado "
+                f"en geometría paramétrica, revisar ensamblador.py"
+            )
+        if reporte["area"] is not None and abs(reporte["area"]) <= AREA_MINIMA:
+            advertencias.append(
+                f"  [diagnóstico] Área degenerada ({reporte['area']:.5f}) — inesperado en "
+                f"geometría paramétrica, revisar ensamblador.py"
+            )
+        for aviso in advertencias:
+            print(f"[geometria][solo_diagnostico]{aviso}")
+        figura_sin_tocar = dict(figura)
+        return figura_sin_tocar, reporte["apto_para_destino"], advertencias
+
     reporte = auditar_geometria(figura, uso_destino)
     advertencias = list(reporte["correcciones_aplicadas"])
 

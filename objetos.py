@@ -1,28 +1,37 @@
 """
 objetos.py — Catálogo de objetos del entorno: geometría + propiedades físicas.
 
-Un objeto del catálogo NO es dos cosas separadas: es UN registro con dos partes que se
+Un objeto del catálogo NO es dos cosas separadas: es UN registro con partes que se
 generan en momentos distintos pero pertenecen al mismo objeto, identificado por su
 descripción (el mismo texto que se usa para dibujarlo en `entorno_virtual`):
 
     {
         "nombre":      "silla de madera",
-        "figura":      { puntos, conexiones, primitivas }   <- geometría (ia_interprete)
+        "figura":      { puntos, conexiones, primitivas }   <- geometría heredada (ia_interprete)
+                                                                 o bbox placeholder ("esfera")
+                                                                 si la geometría real es una Malla
+        "malla":       { lod_bajo, lod_alto, radio_bounding, origen, ... } | None
+                                                             <- Malla real (biblioteca_mallas.py /
+                                                                malla_ia_async.py), formato de
+                                                                optimizacion_malla.serializar_json()
         "propiedades": { material, peso_kg, ... }            <- ficha física (este módulo)
     }
 
 Orden de generación — IMPORTANTE:
-    Primero se pide la geometría y se dibuja. Recién cuando eso terminó se pide la ficha
-    de propiedades físicas. NUNCA se piden las dos cosas en paralelo: en hardware sin GPU
-    dedicada (como las PCs que usa este proyecto), tener dos respuestas del modelo
-    "vivas" al mismo tiempo duplica la memoria que Ollama necesita y puede colgar el
+    Primero se resuelve la geometría (biblioteca -> Malla real de una, o si no hay HIT,
+    fallback LLM + malla_ia_async en background) y se dibuja. Recién cuando eso terminó se
+    pide la ficha de propiedades físicas. NUNCA se piden dos cosas al modelo en paralelo: en
+    hardware sin GPU dedicada (como las PCs que usa este proyecto), tener dos respuestas del
+    modelo "vivas" al mismo tiempo duplica la memoria que Ollama necesita y puede colgar el
     proceso o tirar el modelo. `crear_objeto()` implementa exactamente esa secuencia y
     avisa con callbacks en cada etapa para que quien dibuja no tenga que esperar a que
-    las propiedades estén listas.
+    las propiedades (ni la malla real, si vino del fallback) estén listas.
 
 Funciones principales:
-    crear_objeto(descripcion, callback_figura, callback_propiedades)
-        -> orquesta TODO: geometría primero, propiedades después, en secuencia.
+    crear_objeto(descripcion, callback_figura, callback_propiedades, callback_malla)
+        -> orquesta TODO: biblioteca/geometría primero, propiedades después, en secuencia;
+           `callback_malla` avisa aparte cuando malla_ia_async termina en background
+           (solo si no hubo HIT de biblioteca al crear el objeto).
     generar_propiedades(descripcion)        -> solo la ficha de propiedades (paso 2 solo)
     actualizar_propiedades(propiedades, pedido) -> ficha recalculada según un pedido
     guardar_objeto / cargar_objeto / listar_objetos / eliminar_objeto -> persistencia
@@ -44,6 +53,11 @@ import geometria as geo     # auditoría topológica (skill 02) antes de guardar
 import termodinamica as term  # análisis térmico bajo demanda (skill 04) sobre un objeto ya creado
 import calculo_estructural as est  # tensión/FS/deflexión bajo demanda (skill 05) sobre un objeto ya creado
 import electrico as elec    # ley de Ohm / red de componentes bajo demanda (skill 06)
+import biblioteca_mallas as biblioteca   # fuente PRINCIPAL de geometría: HIT = Malla real sin pasar por el modelo
+import malla_ia_async as malla_ia        # MISS de biblioteca -> generación IA de Malla en background
+import optimizacion_malla as opt         # mismo formato de serialización para la Malla de un HIT que para la de malla_ia_async
+import ensamblador as ens                # kernel paramétrico (ver plan_kernel_parametrico.md) — 2do en prioridad, entre biblioteca y el fallback LLM viejo
+from malla import PX_POR_CM              # único factor de escala cm -> unidades de escena (plan, sección 5.2)
 
 
 # ---------------------------------------------------------------------------
@@ -157,17 +171,20 @@ def cargar_objeto(nombre: str) -> dict | None:
 
 def guardar_objeto(nombre: str, figura: dict | None = None,
                     propiedades: dict | None = None,
-                    propiedades_extendidas: dict | None = None) -> dict:
+                    propiedades_extendidas: dict | None = None,
+                    malla: dict | None = None) -> dict:
     """Crea o actualiza el registro de `nombre`.
 
     Se le puede pasar solo `figura` (recién dibujada, todavía sin características), solo
     `propiedades` (llegaron después, o se editaron a mano), `propiedades_extendidas` (skill
     03_ciencia_materiales, generada bajo demanda la primera vez que hace falta para un
-    cálculo térmico o estructural), o cualquier combinación de las tres. Lo que no se pase
-    se completa con lo que ya hubiera guardado antes, o con una plantilla vacía si es la
-    primera vez. Esto es lo que permite guardar el objeto en pasos sucesivos sin pisar lo
-    anterior: primero geometría, después propiedades, y más adelante (bajo demanda) la
-    ficha extendida de materiales.
+    cálculo térmico o estructural), `malla` (Malla real de biblioteca o de malla_ia_async,
+    formato de optimizacion_malla.serializar_json — ver docstring de nivel de módulo), o
+    cualquier combinación de las cuatro. Lo que no se pase se completa con lo que ya
+    hubiera guardado antes, o con una plantilla vacía (None para `malla`) si es la primera
+    vez. Esto es lo que permite guardar el objeto en pasos sucesivos sin pisar lo anterior:
+    primero geometría (biblioteca o fallback), después propiedades, y en cualquier momento
+    posterior una Malla real que llegó en background reemplazando al placeholder inicial.
     """
     db = _cargar_db()
     existente = db.get(nombre, {})
@@ -180,10 +197,12 @@ def guardar_objeto(nombre: str, figura: dict | None = None,
         propiedades_extendidas if propiedades_extendidas is not None
         else existente.get("propiedades_extendidas", {})
     )
+    malla_final = malla if malla is not None else existente.get("malla")
 
     registro = {
         "nombre": nombre,
         "figura": figura_final,
+        "malla": malla_final,
         "propiedades": propiedades_final,
         "propiedades_extendidas": propiedades_extendidas_final,
         "creado": existente.get("creado", time.strftime("%Y-%m-%d %H:%M:%S")),
@@ -556,57 +575,239 @@ def _propiedades_extendidas_actualizadas(nombre: str, registro: dict) -> dict:
 # Orquestación: geometría primero, propiedades después — NUNCA en paralelo
 # ---------------------------------------------------------------------------
 
-def crear_objeto(descripcion: str, callback_figura=None, callback_propiedades=None) -> dict | None:
-    """Crea un objeto completo del entorno: la geometría y sus propiedades físicas,
-    pedidas EN SECUENCIA, nunca al mismo tiempo.
+def _figura_placeholder_desde_malla(radio_bounding: float) -> dict:
+    """Figura placeholder para cuando la geometría real es una Malla
+    (biblioteca o IA) en vez de wireframe/primitivas del fallback LLM.
+    ubicacion.py sigue sin enterarse de que hay una Malla real detrás: solo
+    ve una primitiva "esfera" más, el mismo tipo que ya usa para resolver
+    bbox/colisiones de las primitivas 3D heredadas (ver docstring de nivel
+    de módulo de entorno_virtual.py y PLAN_RECONSTRUCCION_MALLAS.md,
+    sección 4.3). Centrada en (0.5, 0.5, 0.5) porque la posición real la
+    resuelve ubicacion.ubicar_y_registrar() a partir de este bbox, no acá."""
+    return {
+        "puntos": [],
+        "conexiones": [],
+        "primitivas": [
+            {"tipo": "esfera", "cx": 0.5, "cy": 0.5, "cz": 0.5, "r": radio_bounding}
+        ],
+    }
 
-    1) Pide la geometría (ia_interprete.generar_figura). Si sale bien, guarda ese avance
-       y llama a `callback_figura(nombre, registro)` — pensado para que quien llama pueda
-       dibujarla en el entorno de inmediato, sin esperar el paso 2.
-    2) Recién ahí, con el primer pedido al modelo ya resuelto y liberado, pide la ficha de
-       propiedades físicas (generar_propiedades). Si sale bien, actualiza el registro
-       guardado y llama a `callback_propiedades(nombre, registro)`.
+
+# ---------------------------------------------------------------------------
+# Kernel paramétrico (ver plan_kernel_parametrico.md) — Paso A (LLM decide
+# partes+dims_cm+contacto) + Paso B (ensamblador.py resuelve todo en Python,
+# sin LLM). Reemplaza al pipeline viejo de coordenadas-por-texto SOLO para
+# los objetos que el modelo declara "factible"; si no, `crear_objeto` cae al
+# fallback de siempre (ia_interprete.generar_figura), sin romper nada.
+# ---------------------------------------------------------------------------
+
+def generar_geometria_parametrica(descripcion: str) -> "tuple[object, float] | None":
+    """Paso A + Paso B del kernel paramétrico. Le pide al modelo una
+    descomposición en `Parte`s (forma + dims_cm + contacto), y si es
+    "factible" y pasa la validación Pydantic, resuelve el ensamble 100% en
+    Python (ensamblador.resolver_ensamble) — nunca hay coordenadas de escena
+    escritas por el modelo.
+
+    Devuelve (malla_cm, radio_bounding_relativo) si tuvo éxito, o None si:
+      - el modelo no respondió o no devolvió JSON parseable,
+      - `factible=False` o la validación Pydantic falló (forma inválida,
+        dims_cm no numéricas, etc.),
+      - `ensamblador.resolver_ensamble` lanzó `ErrorEnsamble` (contacto a
+        parte inexistente, ciclo de dependencias).
+    En cualquiera de esos casos, quien llama (crear_objeto) debe caer al
+    fallback del pipeline viejo — nunca se bloquea la creación del objeto
+    por esto (mismo criterio que el resto del proyecto, skill 00).
+
+    `radio_bounding_relativo` ya viene convertido de cm a la misma unidad
+    relativa [0,1] que usa `Malla.radio_bounding()` para las mallas de
+    biblioteca/IA (ver EntornoVirtual.agregar_figura_desde_malla): se divide
+    por PX_POR_CM y por el tamaño de panel de referencia, para que el objeto
+    entre en escena con un tamaño físicamente coherente con sus dims_cm.
+    """
+    print(f"[objetos][paramétrico] Pidiendo composición paramétrica para '{descripcion}'...")
+    contenido = modelos.llamar("composicion_parametrica", user_content=descripcion)
+    datos = ia._extraer_json(contenido)
+    if not datos:
+        print("[objetos][paramétrico] El modelo no devolvió un JSON parseable.")
+        return None
+
+    partes = ens.partes_desde_json_llm(datos)
+    if not partes:
+        print("[objetos][paramétrico] No factible o no pasó la validación Pydantic; "
+              "se cae al pipeline viejo.")
+        return None
+
+    try:
+        malla_cm = ens.ensamblar_partes(partes)
+    except ens.ErrorEnsamble as e:
+        print(f"[objetos][paramétrico] ErrorEnsamble ({e}); se cae al pipeline viejo.")
+        return None
+
+    if malla_cm.num_vertices() == 0:
+        print("[objetos][paramétrico] Ensamble vacío; se cae al pipeline viejo.")
+        return None
+
+    # cm -> relativo [0,1] de escena: PX_POR_CM da píxeles de panel por cm
+    # (definido una sola vez en malla.py, ver sección 5.2 del plan); se
+    # normaliza además por un panel de referencia de 960px (mismo PANEL_W
+    # que usa main.py hoy) para que el radio quede expresado en la misma
+    # escala relativa que ya interpreta EntornoVirtual.agregar_figura_desde_malla.
+    PANEL_REFERENCIA_PX = 960.0
+    radio_bounding_relativo = (malla_cm.radio_bounding() * PX_POR_CM) / PANEL_REFERENCIA_PX
+
+    print(f"[objetos][paramétrico] ✓ Ensamble resuelto: {len(partes)} partes, "
+          f"{malla_cm.num_vertices()} vértices, {malla_cm.num_caras()} caras.")
+    return malla_cm, radio_bounding_relativo
+
+
+def crear_objeto(descripcion: str, callback_figura=None, callback_propiedades=None,
+                  callback_malla=None) -> dict | None:
+    """Crea un objeto completo del entorno: geometría, Malla real (si corresponde)
+    y propiedades físicas, resueltas EN SECUENCIA, nunca al mismo tiempo.
+
+    0) Biblioteca primero (biblioteca_mallas.buscar): si ya hay algo parecido
+       archivado, se usa esa Malla real DE UNA, sin pasarle nada al modelo para
+       la geometría (milisegundos, no segundos). Se guarda un bbox placeholder
+       tipo "esfera" en `figura` (para que ubicacion.py resuelva dónde va,
+       igual que con cualquier primitiva 3D heredada) más la Malla real en
+       `malla`, y se llama a `callback_figura(nombre, registro)`.
+       `callback_malla` NO se llama en este caso: no hay nada async pendiente.
+
+    1) Si no hay HIT (MISS de biblioteca): se intenta el KERNEL PARAMÉTRICO
+       (ver plan_kernel_parametrico.md / generar_geometria_parametrica) —
+       el modelo descompone el objeto en Partes con forma+dims_cm+contacto y
+       `ensamblador.py` resuelve el ensamble 100% en Python, sin escribir
+       coordenadas de escena. Si el modelo declara "factible" y el ensamble
+       resuelve sin errores, el objeto queda listo con esa Malla exacta
+       (camino "paramétrico"; no hace falta malla_ia_async ni el fallback
+       de abajo). `callback_malla` no se llama en este caso.
+
+    2) Si el kernel paramétrico no resolvió (no factible, JSON inválido, o
+       `ErrorEnsamble`): geometría heredada del fallback LLM de coordenadas
+       (ia_interprete.generar_figura), igual que siempre, se dibuja y se
+       llama a `callback_figura(nombre, registro)` -- Y ADEMÁS se dispara
+       malla_ia_async.solicitar() en un hilo daemon aparte para intentar
+       reemplazar esa geometría heredada por una Malla real más adelante, sin
+       bloquear nada de lo anterior. Cuando esa generación IA termina (con o
+       sin éxito), se actualiza el registro en disco y se llama a
+       `callback_malla(nombre, malla_json | None)`.
+
+    3) Recién con la geometría resuelta (biblioteca, paramétrico o fallback)
+       y el primer pedido al modelo ya liberado, se pide la ficha de
+       propiedades físicas (generar_propiedades) del MISMO objeto. Si sale
+       bien, actualiza el registro guardado y llama a
+       `callback_propiedades(nombre, registro)`.
 
     Por qué en secuencia y no en paralelo: pedirle al modelo dos cosas distintas al mismo
     tiempo obliga a tener (al menos) dos contextos vivos en Ollama simultáneamente. En
     hardware sin GPU dedicada y con RAM limitada, eso puede colgar el proceso o forzar a
     Ollama a descargar y recargar el modelo entre pedidos, mucho más lento que hacerlo uno
-    detrás del otro.
+    detrás del otro. La generación IA de malla (paso 1, SD-Turbo + TripoSR) usa la GPU, no
+    Ollama, y corre en su propio hilo con su propio lock exclusivo de GPU (ver
+    malla_ia_async._LOCK_GPU) -- por eso puede quedar disparada en background sin violar
+    esta regla.
 
     Devuelve el registro final (con propiedades, si se pudieron generar) o None si ni
-    siquiera la geometría se pudo generar. Si la geometría sale bien pero las propiedades
-    fallan, devuelve igual el registro con la figura y propiedades vacías —el objeto queda
-    en el entorno, solo que sin ficha física todavía (se puede regenerar después con
-    "Actualizar con IA" en el panel).
+    siquiera la geometría se pudo resolver (ni biblioteca ni fallback). Si la geometría sale
+    bien pero las propiedades fallan, devuelve igual el registro con la figura y propiedades
+    vacías —el objeto queda en el entorno, solo que sin ficha física todavía (se puede
+    regenerar después con "Actualizar con IA" en el panel).
     """
     print(f"[objetos] === Creando objeto '{descripcion}' (geometría → propiedades) ===")
 
-    # 1) Geometría primero. Esto es lo único que hace falta para poder dibujar.
-    figura = ia.generar_figura(descripcion)
-    if not figura:
-        print(f"[objetos] No se pudo generar la geometría de '{descripcion}'. Se cancela.")
-        return None
-
-    # 1b) Auditoría topológica (skill 02_geometria, módulo geometria.py) — 100%
-    # determinística, sin volver a llamar al modelo. Cierra contornos casi
-    # cerrados y normaliza orientación en silencio; solo avisa fuerte si hay
-    # auto-intersección real o geometría degenerada. Acá el destino es
-    # "render_only" (escena 3D del entorno) — CAD/CFD auditan de nuevo, más
-    # estricto, recién al exportar (ver geo.preparar_para_cad/preparar_para_cfd).
-    figura_auditada, geo_ok, geo_avisos = geo.validar_y_corregir_geometria(figura, "render_only")
-    for aviso in geo_avisos:
-        print(f"[objetos][geometria]{aviso}")
-    if geo_ok:
-        figura = figura_auditada
+    # 0) Biblioteca primero: HIT = Malla real de una, sin tocar el modelo
+    # para geometría (ver biblioteca_mallas.py).
+    resultado_bib = biblioteca.buscar(descripcion)
+    if resultado_bib is not None:
+        print(f"[objetos] '{descripcion}': HIT de biblioteca ('{resultado_bib.nombre}', "
+              f"origen={resultado_bib.origen}); se usa esa Malla real. (camino: biblioteca)")
+        figura = _figura_placeholder_desde_malla(resultado_bib.radio_bounding)
+        malla_info = opt.serializar_json(
+            resultado_bib.nombre, resultado_bib.malla_lod_baja, resultado_bib.malla_lod_alta,
+            origen=resultado_bib.origen, radio_bounding=resultado_bib.radio_bounding,
+        )
+        registro = guardar_objeto(descripcion, figura=figura, malla=malla_info)
+        if callback_figura:
+            callback_figura(descripcion, registro)
     else:
-        print(f"[objetos] '{descripcion}': geometría con violaciones graves; se dibuja igual "
-              f"(uso_destino=render_only) pero no sería apta si luego se exporta a CAD/CFD.")
+        # 1) MISS de biblioteca: intentar el kernel paramétrico (ver
+        # plan_kernel_parametrico.md) antes del fallback LLM de coordenadas.
+        # Si el modelo declara la geometría "factible" y el ensamble resuelve
+        # sin errores, el objeto nace con contorno cerrado y contactos
+        # exactos POR CONSTRUCCIÓN — no hace falta auditoría de geometria.py
+        # para corregir nada, esa auditoría se sigue corriendo igual como
+        # red de seguridad barata (ver sección 8.1 del plan).
+        resultado_param = generar_geometria_parametrica(descripcion)
+        if resultado_param is not None:
+            malla_cm, radio_bounding_relativo = resultado_param
+            print(f"[objetos] '{descripcion}': resuelto por kernel paramétrico "
+                  f"(camino: paramétrico).")
+            figura = _figura_placeholder_desde_malla(radio_bounding_relativo)
+            malla_info = opt.serializar_json(
+                descripcion, malla_cm, None, origen="parametrico_kernel",
+                radio_bounding=radio_bounding_relativo,
+            )
+            registro = guardar_objeto(descripcion, figura=figura, malla=malla_info)
+            if callback_figura:
+                callback_figura(descripcion, registro)
+            propiedades = generar_propiedades(descripcion)
+            if propiedades is not None:
+                registro = guardar_objeto(descripcion, propiedades=propiedades)
+            else:
+                print(f"[objetos] Geometría OK (paramétrico), pero fallaron las propiedades de '{descripcion}'.")
+            if callback_propiedades:
+                callback_propiedades(descripcion, registro if propiedades is not None else None)
+            print(f"[objetos] === '{descripcion}' terminado (camino: paramétrico) ===")
+            return registro
 
-    registro = guardar_objeto(descripcion, figura=figura)
-    if callback_figura:
-        callback_figura(descripcion, registro)
+        # 2) Ni biblioteca ni kernel paramétrico resolvieron: geometría
+        # heredada del fallback LLM de coordenadas, como siempre, más
+        # malla_ia_async disparada en background aparte.
+        print(f"[objetos] '{descripcion}': camino paramétrico no factible; "
+              f"se usa el fallback de coordenadas (camino: fallback_llm).")
+        figura = ia.generar_figura(descripcion)
+        if not figura:
+            print(f"[objetos] No se pudo generar la geometría de '{descripcion}'. Se cancela.")
+            return None
 
-    # 2) Recién ahora se pide la ficha de propiedades físicas del MISMO objeto.
+        # 1b) Auditoría topológica (skill 02_geometria, módulo geometria.py) — 100%
+        # determinística, sin volver a llamar al modelo. Cierra contornos casi
+        # cerrados y normaliza orientación en silencio; solo avisa fuerte si hay
+        # auto-intersección real o geometría degenerada. Acá el destino es
+        # "render_only" (escena 3D del entorno) — CAD/CFD auditan de nuevo, más
+        # estricto, recién al exportar (ver geo.preparar_para_cad/preparar_para_cfd).
+        figura_auditada, geo_ok, geo_avisos = geo.validar_y_corregir_geometria(figura, "render_only")
+        for aviso in geo_avisos:
+            print(f"[objetos][geometria]{aviso}")
+        if geo_ok:
+            figura = figura_auditada
+        else:
+            print(f"[objetos] '{descripcion}': geometría con violaciones graves; se dibuja igual "
+                  f"(uso_destino=render_only) pero no sería apta si luego se exporta a CAD/CFD.")
+
+        registro = guardar_objeto(descripcion, figura=figura)
+        if callback_figura:
+            callback_figura(descripcion, registro)
+
+        def _al_terminar_malla_ia(pedido, malla_json):
+            # Corre en el hilo daemon de malla_ia_async (ver
+            # malla_ia_async.solicitar) -- nunca toca UI directo, de eso se
+            # encarga quien nos pasó `callback_malla` (ver
+            # main.py::_generar_y_encolar, que usa en_hilo_ui). Acá solo
+            # persistimos el resultado en objetos_db.json: biblioteca_mallas
+            # ya archivó la Malla en biblioteca_mallas/ desde adentro de
+            # malla_ia_async._generar_sync, pero eso es una biblioteca
+            # aparte -- sin este guardado, cargar_objeto(pedido) no vería la
+            # malla real hasta la próxima vez que alguien la busque ahí.
+            if malla_json:
+                guardar_objeto(pedido, malla=malla_json)
+            if callback_malla:
+                callback_malla(pedido, malla_json)
+
+        malla_ia.solicitar(descripcion, callback_terminado=_al_terminar_malla_ia)
+
+    # 2) Recién ahora se pide la ficha de propiedades físicas del MISMO objeto,
+    # sea cual sea el camino de geometría de arriba.
     propiedades = generar_propiedades(descripcion)
     if propiedades is not None:
         registro = guardar_objeto(descripcion, propiedades=propiedades)

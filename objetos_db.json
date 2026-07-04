@@ -54,7 +54,7 @@
           "cz": 0.5,
           "ancho": 0.5,
           "alto": 0.38,
-          "profundo": 0.5
+          "profundo": 0.18
         },
         {
           "tipo": "cubo",
@@ -62,11 +62,12 @@
           "cy": 0.2,
           "cz": 0.5,
           "ancho": 0.5,
-          "alto": 0.18,
-          "profundo": 0.5
+          "alto": 0.38,
+          "profundo": 0.18
         }
       ]
     },
+    "malla": null,
     "propiedades": {
       "material": "madera",
       "peso_kg": 100.0,
@@ -85,7 +86,7 @@
     },
     "propiedades_extendidas": {},
     "creado": "2026-07-02 16:12:54",
-    "actualizado": "2026-07-02 20:54:14"
+    "actualizado": "2026-07-04 15:55:51"
   },
   "persona": {
     "nombre": "persona",
