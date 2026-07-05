@@ -49,15 +49,19 @@ import time
 
 import ia_interprete as ia  # reutiliza _extraer_json / catálogo (las llamadas al modelo pasan por modelos.py)
 import modelos              # modelo/temperatura de cada skill vienen de modelos_config.json
-import geometria as geo     # auditoría topológica (skill 02) antes de guardar/dibujar cualquier figura
 import termodinamica as term  # análisis térmico bajo demanda (skill 04) sobre un objeto ya creado
 import calculo_estructural as est  # tensión/FS/deflexión bajo demanda (skill 05) sobre un objeto ya creado
 import electrico as elec    # ley de Ohm / red de componentes bajo demanda (skill 06)
 import biblioteca_mallas as biblioteca   # fuente PRINCIPAL de geometría: HIT = Malla real sin pasar por el modelo
-import malla_ia_async as malla_ia        # MISS de biblioteca -> generación IA de Malla en background
-import optimizacion_malla as opt         # mismo formato de serialización para la Malla de un HIT que para la de malla_ia_async
-import ensamblador as ens                # kernel paramétrico (ver plan_kernel_parametrico.md) — 2do en prioridad, entre biblioteca y el fallback LLM viejo
+import optimizacion_malla as opt         # mismo formato de serialización para la Malla de un HIT que para la del kernel paramétrico
+import ensamblador as ens                # kernel paramétrico (ver plan_kernel_parametrico.md) — 2do en prioridad, ya sin caída al pipeline viejo (Fase 6: robustecimiento)
 from malla import PX_POR_CM              # único factor de escala cm -> unidades de escena (plan, sección 5.2)
+# NOTA: malla_ia_async (SD-Turbo + TripoSR) ya no se dispara desde acá. Antes
+# generaba una Malla real en background para reemplazar la geometría heredada
+# del fallback LLM de coordenadas; ese fallback ya no existe en el camino de
+# MISS de biblioteca (ver crear_objeto) porque el kernel paramétrico + su red
+# de seguridad determinística siempre producen una Malla real de una. El
+# módulo sigue disponible para quien quiera invocarlo manualmente.
 
 
 # ---------------------------------------------------------------------------
@@ -597,66 +601,170 @@ def _figura_placeholder_desde_malla(radio_bounding: float) -> dict:
 # Kernel paramétrico (ver plan_kernel_parametrico.md) — Paso A (LLM decide
 # partes+dims_cm+contacto) + Paso B (ensamblador.py resuelve todo en Python,
 # sin LLM). Reemplaza al pipeline viejo de coordenadas-por-texto SOLO para
-# los objetos que el modelo declara "factible"; si no, `crear_objeto` cae al
-# fallback de siempre (ia_interprete.generar_figura), sin romper nada.
+# ---------------------------------------------------------------------------
+# Kernel paramétrico (ver plan_kernel_parametrico.md) — Paso A (LLM decide
+# partes+dims_cm+contacto) + Paso B (ensamblador.py resuelve todo en Python,
+# sin LLM). Refuerzo: cada "hueco" del pipeline (JSON no parseable, no
+# factible, forma inválida, ErrorEnsamble) se atiende con una tarea de LLM
+# ESPECÍFICA y acotada antes de tocar la red de seguridad determinística —
+# nunca se cae al pipeline viejo de coordenadas de escena
+# (ia_interprete.generar_figura); ver sección "Fase 6 — robustecimiento"
+# del plan.
 # ---------------------------------------------------------------------------
 
-def generar_geometria_parametrica(descripcion: str) -> "tuple[object, float] | None":
-    """Paso A + Paso B del kernel paramétrico. Le pide al modelo una
-    descomposición en `Parte`s (forma + dims_cm + contacto), y si es
-    "factible" y pasa la validación Pydantic, resuelve el ensamble 100% en
-    Python (ensamblador.resolver_ensamble) — nunca hay coordenadas de escena
-    escritas por el modelo.
+MAX_INTENTOS_COMPOSICION = 3   # 1 normal + 2 reparaciones dirigidas, antes de la plantilla
 
-    Devuelve (malla_cm, radio_bounding_relativo) si tuvo éxito, o None si:
-      - el modelo no respondió o no devolvió JSON parseable,
-      - `factible=False` o la validación Pydantic falló (forma inválida,
-        dims_cm no numéricas, etc.),
-      - `ensamblador.resolver_ensamble` lanzó `ErrorEnsamble` (contacto a
-        parte inexistente, ciclo de dependencias).
-    En cualquiera de esos casos, quien llama (crear_objeto) debe caer al
-    fallback del pipeline viejo — nunca se bloquea la creación del objeto
-    por esto (mismo criterio que el resto del proyecto, skill 00).
 
-    `radio_bounding_relativo` ya viene convertido de cm a la misma unidad
-    relativa [0,1] que usa `Malla.radio_bounding()` para las mallas de
-    biblioteca/IA (ver EntornoVirtual.agregar_figura_desde_malla): se divide
-    por PX_POR_CM y por el tamaño de panel de referencia, para que el objeto
-    entre en escena con un tamaño físicamente coherente con sus dims_cm.
+def _pedir_composicion(descripcion: str, temperatura: float | None = None) -> dict | None:
+    """Intento 1: pedido normal a la skill 'composicion_parametrica'."""
+    contenido = modelos.llamar("composicion_parametrica", user_content=descripcion,
+                                temperatura=temperatura)
+    return ia._extraer_json(contenido)
+
+
+def _pedir_reparacion(datos_previos: dict, motivo_error: str) -> dict | None:
+    """Tarea de LLM ESPECÍFICA y acotada (skill 'reparacion_composicion_parametrica'):
+    no rediseña el objeto, corrige puntualmente el motivo de error que ya se
+    detectó en Python (nunca se le pide al modelo que adivine qué falló —
+    Python ya lo sabe con precisión, así que se lo decimos)."""
+    contenido_usuario = (
+        f"JSON que falló:\n{json.dumps(datos_previos, ensure_ascii=False)}\n\n"
+        f"Motivo exacto del error: {motivo_error}"
+    )
+    contenido = modelos.llamar("reparacion_composicion_parametrica", user_content=contenido_usuario)
+    return ia._extraer_json(contenido)
+
+
+def _pedir_composicion_reforzada(descripcion: str, motivo_anterior: str) -> dict | None:
+    """Intento cuando el motivo de la falla anterior fue 'factible: false'
+    (no hay Partes concretas para reparar — pedirle al modelo de reparación
+    que arregle una lista vacía no tiene sentido). Es una tarea distinta,
+    también específica: se le repite el pedido a la MISMA skill de
+    composición pero con el recordatorio explícito de que la mayoría de los
+    objetos sólidos SÍ son representables con el catálogo cerrado, para que
+    reconsidere en vez de rendirse de nuevo con el mismo criterio."""
+    contenido_usuario = (
+        f"{descripcion}\n\n"
+        f"Un intento anterior para este mismo objeto respondió 'factible: false' "
+        f"({motivo_anterior}). Antes de repetir esa respuesta: pensá de nuevo si el objeto "
+        f"se puede aproximar como combinación de caja/cilindro/esfera/prisma_triangular/tubo "
+        f"— la enorme mayoría de los objetos sólidos del mundo real (muebles, construcciones, "
+        f"vehículos simples, herramientas, utensilios) SÍ se pueden. Solo respondé "
+        f"'factible: false' de nuevo si de verdad es una silueta artística, un logo, texto, o "
+        f"una forma orgánica muy irregular."
+    )
+    contenido = modelos.llamar("composicion_parametrica", user_content=contenido_usuario,
+                                temperatura=0.15)
+    return ia._extraer_json(contenido)
+
+
+def generar_geometria_parametrica(descripcion: str) -> "tuple[object, float]":
+    """Paso A + Paso B del kernel paramétrico, con reintentos dirigidos.
+    A diferencia de la versión inicial, esta función NUNCA devuelve None:
+    agota una cadena de tareas de LLM específicas (composición normal ->
+    reparación dirigida al error puntual -> segunda reparación) y, si todas
+    fallan, cae a una plantilla paramétrica determinística por palabra clave
+    (`ensamblador.buscar_plantilla_parametrica`, sin LLM) o, en última
+    instancia, a una caja genérica (`ensamblador.plantilla_generica_de_piso`).
+    Ninguno de esos dos últimos escalones es "el sistema anterior": son
+    parte del kernel paramétrico mismo (Partes -> resolver_ensamble), así
+    que el objeto siempre nace con contorno cerrado y contactos exactos por
+    construcción, nunca con coordenadas de escena escritas a mano por un LLM.
+
+    Devuelve siempre (malla_cm, radio_bounding_relativo).
     """
-    print(f"[objetos][paramétrico] Pidiendo composición paramétrica para '{descripcion}'...")
-    contenido = modelos.llamar("composicion_parametrica", user_content=descripcion)
-    datos = ia._extraer_json(contenido)
-    if not datos:
-        print("[objetos][paramétrico] El modelo no devolvió un JSON parseable.")
-        return None
+    datos: dict | None = None
+    partes = None
+    motivo_error = None
+    tipo_error = None   # "sin_json" | "no_factible" | "estructural" — decide qué tarea de LLM usar en el siguiente intento
 
-    partes = ens.partes_desde_json_llm(datos)
-    if not partes:
-        print("[objetos][paramétrico] No factible o no pasó la validación Pydantic; "
-              "se cae al pipeline viejo.")
-        return None
+    for intento in range(1, MAX_INTENTOS_COMPOSICION + 1):
+        if intento == 1:
+            print(f"[objetos][paramétrico] Intento 1/{MAX_INTENTOS_COMPOSICION}: "
+                  f"composición inicial para '{descripcion}'...")
+            datos = _pedir_composicion(descripcion)
+        elif tipo_error == "sin_json":
+            print(f"[objetos][paramétrico] Intento {intento}/{MAX_INTENTOS_COMPOSICION}: "
+                  f"sin JSON previo, se reintenta la composición inicial (temp. baja)...")
+            datos = _pedir_composicion(descripcion, temperatura=0.1)
+        elif tipo_error == "no_factible":
+            print(f"[objetos][paramétrico] Intento {intento}/{MAX_INTENTOS_COMPOSICION}: "
+                  f"reintento reforzado (el modelo dijo 'no factible')...")
+            datos = _pedir_composicion_reforzada(descripcion, motivo_error)
+        else:   # "estructural": hay un JSON concreto con un error puntual para reparar
+            print(f"[objetos][paramétrico] Intento {intento}/{MAX_INTENTOS_COMPOSICION}: "
+                  f"reparación dirigida ({motivo_error})...")
+            datos = _pedir_reparacion(datos, motivo_error)
 
-    try:
-        malla_cm = ens.ensamblar_partes(partes)
-    except ens.ErrorEnsamble as e:
-        print(f"[objetos][paramétrico] ErrorEnsamble ({e}); se cae al pipeline viejo.")
-        return None
+        if not datos:
+            motivo_error = "el modelo no devolvió un JSON parseable"
+            tipo_error = "sin_json"
+            print(f"[objetos][paramétrico]   -> falló: {motivo_error}")
+            continue
 
-    if malla_cm.num_vertices() == 0:
-        print("[objetos][paramétrico] Ensamble vacío; se cae al pipeline viejo.")
-        return None
+        if not datos.get("partes"):
+            motivo_error = "el modelo marcó 'factible: false' (sin partes)"
+            tipo_error = "no_factible"
+            print(f"[objetos][paramétrico]   -> falló: {motivo_error}")
+            continue
 
-    # cm -> relativo [0,1] de escena: PX_POR_CM da píxeles de panel por cm
-    # (definido una sola vez en malla.py, ver sección 5.2 del plan); se
-    # normaliza además por un panel de referencia de 960px (mismo PANEL_W
-    # que usa main.py hoy) para que el radio quede expresado en la misma
-    # escala relativa que ya interpreta EntornoVirtual.agregar_figura_desde_malla.
+        partes = ens.partes_desde_json_llm(datos)
+        if not partes:
+            motivo_error = (
+                "el JSON no pasó la validación Pydantic (forma fuera del catálogo cerrado, "
+                "dims_cm no numéricas, claves faltantes, o esquema incorrecto)"
+            )
+            tipo_error = "estructural"
+            print(f"[objetos][paramétrico]   -> falló: {motivo_error}")
+            partes = None
+            continue
+
+        try:
+            malla_cm = ens.ensamblar_partes(partes)
+        except ens.ErrorEnsamble as e:
+            motivo_error = str(e)
+            tipo_error = "estructural"
+            print(f"[objetos][paramétrico]   -> ErrorEnsamble: {motivo_error}")
+            partes = None
+            continue
+
+        if malla_cm.num_vertices() == 0:
+            motivo_error = "el ensamble resultó en una malla vacía"
+            tipo_error = "estructural"
+            print(f"[objetos][paramétrico]   -> falló: {motivo_error}")
+            partes = None
+            continue
+
+        print(f"[objetos][paramétrico] ✓ Ensamble resuelto en el intento {intento}: "
+              f"{len(partes)} partes, {malla_cm.num_vertices()} vértices, "
+              f"{malla_cm.num_caras()} caras.")
+        return _malla_a_radio_relativo(malla_cm)
+
+    # Se agotaron los intentos con LLM: red de seguridad determinística del
+    # KERNEL PARAMÉTRICO (no del pipeline viejo) — ver ensamblador.py.
+    print(f"[objetos][paramétrico] Se agotaron los {MAX_INTENTOS_COMPOSICION} intentos con LLM "
+          f"para '{descripcion}'; se usa la red de seguridad determinística del kernel paramétrico.")
+    partes_plantilla = ens.buscar_plantilla_parametrica(descripcion)
+    if partes_plantilla:
+        print(f"[objetos][paramétrico] Plantilla determinística encontrada por palabra clave "
+              f"({[p.nombre for p in partes_plantilla]}).")
+    else:
+        print("[objetos][paramétrico] Ninguna plantilla por palabra clave; se usa la caja genérica "
+              "(piso absoluto del kernel paramétrico).")
+        partes_plantilla = ens.plantilla_generica_de_piso()
+
+    malla_cm = ens.ensamblar_partes(partes_plantilla)
+    return _malla_a_radio_relativo(malla_cm)
+
+
+def _malla_a_radio_relativo(malla_cm) -> "tuple[object, float]":
+    """cm -> relativo [0,1] de escena: PX_POR_CM da píxeles de panel por cm
+    (definido una sola vez en malla.py, ver sección 5.2 del plan); se
+    normaliza además por un panel de referencia de 960px (mismo PANEL_W
+    que usa main.py hoy) para que el radio quede expresado en la misma
+    escala relativa que ya interpreta EntornoVirtual.agregar_figura_desde_malla."""
     PANEL_REFERENCIA_PX = 960.0
     radio_bounding_relativo = (malla_cm.radio_bounding() * PX_POR_CM) / PANEL_REFERENCIA_PX
-
-    print(f"[objetos][paramétrico] ✓ Ensamble resuelto: {len(partes)} partes, "
-          f"{malla_cm.num_vertices()} vértices, {malla_cm.num_caras()} caras.")
     return malla_cm, radio_bounding_relativo
 
 
@@ -673,29 +781,24 @@ def crear_objeto(descripcion: str, callback_figura=None, callback_propiedades=No
        `malla`, y se llama a `callback_figura(nombre, registro)`.
        `callback_malla` NO se llama en este caso: no hay nada async pendiente.
 
-    1) Si no hay HIT (MISS de biblioteca): se intenta el KERNEL PARAMÉTRICO
-       (ver plan_kernel_parametrico.md / generar_geometria_parametrica) —
-       el modelo descompone el objeto en Partes con forma+dims_cm+contacto y
-       `ensamblador.py` resuelve el ensamble 100% en Python, sin escribir
-       coordenadas de escena. Si el modelo declara "factible" y el ensamble
-       resuelve sin errores, el objeto queda listo con esa Malla exacta
-       (camino "paramétrico"; no hace falta malla_ia_async ni el fallback
-       de abajo). `callback_malla` no se llama en este caso.
+    1) Si no hay HIT (MISS de biblioteca): el KERNEL PARAMÉTRICO (ver
+       plan_kernel_parametrico.md / generar_geometria_parametrica) resuelve
+       la geometría SIEMPRE — ya no existe un camino de vuelta al viejo
+       fallback de coordenadas de escena (ia_interprete.generar_figura).
+       El modelo descompone el objeto en Partes con forma+dims_cm+contacto;
+       si la primera composición no es válida, se ataca el motivo EXACTO del
+       error con tareas de LLM específicas y acotadas (reintentos dirigidos,
+       nunca "probá de nuevo a ciegas"); si aun así no hay éxito, entra la
+       red de seguridad determinística del propio kernel (plantilla por
+       palabra clave o caja genérica — nunca el LLM de coordenadas viejo).
+       `ensamblador.py` resuelve el ensamble 100% en Python. `callback_malla`
+       ya no se usa en este camino (no queda nada async pendiente: la Malla
+       real ya está completa antes de devolver el control).
 
-    2) Si el kernel paramétrico no resolvió (no factible, JSON inválido, o
-       `ErrorEnsamble`): geometría heredada del fallback LLM de coordenadas
-       (ia_interprete.generar_figura), igual que siempre, se dibuja y se
-       llama a `callback_figura(nombre, registro)` -- Y ADEMÁS se dispara
-       malla_ia_async.solicitar() en un hilo daemon aparte para intentar
-       reemplazar esa geometría heredada por una Malla real más adelante, sin
-       bloquear nada de lo anterior. Cuando esa generación IA termina (con o
-       sin éxito), se actualiza el registro en disco y se llama a
-       `callback_malla(nombre, malla_json | None)`.
-
-    3) Recién con la geometría resuelta (biblioteca, paramétrico o fallback)
-       y el primer pedido al modelo ya liberado, se pide la ficha de
-       propiedades físicas (generar_propiedades) del MISMO objeto. Si sale
-       bien, actualiza el registro guardado y llama a
+    2) Recién con la geometría resuelta (biblioteca o paramétrico) y el
+       primer pedido al modelo ya liberado, se pide la ficha de propiedades
+       físicas (generar_propiedades) del MISMO objeto. Si sale bien,
+       actualiza el registro guardado y llama a
        `callback_propiedades(nombre, registro)`.
 
     Por qué en secuencia y no en paralelo: pedirle al modelo dos cosas distintas al mismo
@@ -707,11 +810,12 @@ def crear_objeto(descripcion: str, callback_figura=None, callback_propiedades=No
     malla_ia_async._LOCK_GPU) -- por eso puede quedar disparada en background sin violar
     esta regla.
 
-    Devuelve el registro final (con propiedades, si se pudieron generar) o None si ni
-    siquiera la geometría se pudo resolver (ni biblioteca ni fallback). Si la geometría sale
-    bien pero las propiedades fallan, devuelve igual el registro con la figura y propiedades
-    vacías —el objeto queda en el entorno, solo que sin ficha física todavía (se puede
-    regenerar después con "Actualizar con IA" en el panel).
+    Devuelve el registro final (con propiedades, si se pudieron generar). La geometría en sí
+    ya no puede fallar del todo: biblioteca, el kernel paramétrico y su red de seguridad
+    determinística siempre producen una Malla real. Si la geometría sale bien pero las
+    propiedades fallan, devuelve igual el registro con la figura y propiedades vacías —el
+    objeto queda en el entorno, solo que sin ficha física todavía (se puede regenerar
+    después con "Actualizar con IA" en el panel).
     """
     print(f"[objetos] === Creando objeto '{descripcion}' (geometría → propiedades) ===")
 
@@ -730,81 +834,46 @@ def crear_objeto(descripcion: str, callback_figura=None, callback_propiedades=No
         if callback_figura:
             callback_figura(descripcion, registro)
     else:
-        # 1) MISS de biblioteca: intentar el kernel paramétrico (ver
-        # plan_kernel_parametrico.md) antes del fallback LLM de coordenadas.
-        # Si el modelo declara la geometría "factible" y el ensamble resuelve
-        # sin errores, el objeto nace con contorno cerrado y contactos
-        # exactos POR CONSTRUCCIÓN — no hace falta auditoría de geometria.py
-        # para corregir nada, esa auditoría se sigue corriendo igual como
-        # red de seguridad barata (ver sección 8.1 del plan).
-        resultado_param = generar_geometria_parametrica(descripcion)
-        if resultado_param is not None:
-            malla_cm, radio_bounding_relativo = resultado_param
-            print(f"[objetos] '{descripcion}': resuelto por kernel paramétrico "
-                  f"(camino: paramétrico).")
-            figura = _figura_placeholder_desde_malla(radio_bounding_relativo)
-            malla_info = opt.serializar_json(
-                descripcion, malla_cm, None, origen="parametrico_kernel",
-                radio_bounding=radio_bounding_relativo,
-            )
-            registro = guardar_objeto(descripcion, figura=figura, malla=malla_info)
-            if callback_figura:
-                callback_figura(descripcion, registro)
-            propiedades = generar_propiedades(descripcion)
-            if propiedades is not None:
-                registro = guardar_objeto(descripcion, propiedades=propiedades)
-            else:
-                print(f"[objetos] Geometría OK (paramétrico), pero fallaron las propiedades de '{descripcion}'.")
-            if callback_propiedades:
-                callback_propiedades(descripcion, registro if propiedades is not None else None)
-            print(f"[objetos] === '{descripcion}' terminado (camino: paramétrico) ===")
-            return registro
+        # 1) MISS de biblioteca: el KERNEL PARAMÉTRICO (ver
+        # plan_kernel_parametrico.md) resuelve la geometría SIEMPRE — ya no
+        # existe un camino de vuelta al pipeline viejo de coordenadas de
+        # escena (ia_interprete.generar_figura). Cada "hueco" posible
+        # (JSON inválido, no factible, ErrorEnsamble) se atiende primero
+        # con tareas de LLM específicas y acotadas (reintentos dirigidos,
+        # ver generar_geometria_parametrica) y, si se agotan, con la red de
+        # seguridad determinística del propio kernel (plantilla por palabra
+        # clave o caja genérica) — nunca con el LLM de coordenadas viejo.
+        # El objeto nace con contorno cerrado y contactos exactos POR
+        # CONSTRUCCIÓN, así que la auditoría de geometria.py corre en modo
+        # `solo_diagnostico` (ver sección 8.1 del plan): nunca corrige,
+        # solo alerta si algo salió mal (señal de un bug real, no de un
+        # modelo chico alucinando coordenadas).
+        malla_cm, radio_bounding_relativo = generar_geometria_parametrica(descripcion)
+        print(f"[objetos] '{descripcion}': resuelto por kernel paramétrico (camino: paramétrico).")
 
-        # 2) Ni biblioteca ni kernel paramétrico resolvieron: geometría
-        # heredada del fallback LLM de coordenadas, como siempre, más
-        # malla_ia_async disparada en background aparte.
-        print(f"[objetos] '{descripcion}': camino paramétrico no factible; "
-              f"se usa el fallback de coordenadas (camino: fallback_llm).")
-        figura = ia.generar_figura(descripcion)
-        if not figura:
-            print(f"[objetos] No se pudo generar la geometría de '{descripcion}'. Se cancela.")
-            return None
+        # Diagnóstico de solo lectura sobre la Malla 3D real (watertight/
+        # winding) — nunca sobre el placeholder de bbox, que es solo una
+        # esfera marcadora para ubicacion.py y no tiene nada que auditar.
+        for aviso in ens.diagnosticar_malla_cm(malla_cm):
+            print(f"[objetos][ensamblador]{aviso}")
 
-        # 1b) Auditoría topológica (skill 02_geometria, módulo geometria.py) — 100%
-        # determinística, sin volver a llamar al modelo. Cierra contornos casi
-        # cerrados y normaliza orientación en silencio; solo avisa fuerte si hay
-        # auto-intersección real o geometría degenerada. Acá el destino es
-        # "render_only" (escena 3D del entorno) — CAD/CFD auditan de nuevo, más
-        # estricto, recién al exportar (ver geo.preparar_para_cad/preparar_para_cfd).
-        figura_auditada, geo_ok, geo_avisos = geo.validar_y_corregir_geometria(figura, "render_only")
-        for aviso in geo_avisos:
-            print(f"[objetos][geometria]{aviso}")
-        if geo_ok:
-            figura = figura_auditada
-        else:
-            print(f"[objetos] '{descripcion}': geometría con violaciones graves; se dibuja igual "
-                  f"(uso_destino=render_only) pero no sería apta si luego se exporta a CAD/CFD.")
-
-        registro = guardar_objeto(descripcion, figura=figura)
+        figura = _figura_placeholder_desde_malla(radio_bounding_relativo)
+        malla_info = opt.serializar_json(
+            descripcion, malla_cm, None, origen="parametrico_kernel",
+            radio_bounding=radio_bounding_relativo,
+        )
+        registro = guardar_objeto(descripcion, figura=figura, malla=malla_info)
         if callback_figura:
             callback_figura(descripcion, registro)
-
-        def _al_terminar_malla_ia(pedido, malla_json):
-            # Corre en el hilo daemon de malla_ia_async (ver
-            # malla_ia_async.solicitar) -- nunca toca UI directo, de eso se
-            # encarga quien nos pasó `callback_malla` (ver
-            # main.py::_generar_y_encolar, que usa en_hilo_ui). Acá solo
-            # persistimos el resultado en objetos_db.json: biblioteca_mallas
-            # ya archivó la Malla en biblioteca_mallas/ desde adentro de
-            # malla_ia_async._generar_sync, pero eso es una biblioteca
-            # aparte -- sin este guardado, cargar_objeto(pedido) no vería la
-            # malla real hasta la próxima vez que alguien la busque ahí.
-            if malla_json:
-                guardar_objeto(pedido, malla=malla_json)
-            if callback_malla:
-                callback_malla(pedido, malla_json)
-
-        malla_ia.solicitar(descripcion, callback_terminado=_al_terminar_malla_ia)
+        propiedades = generar_propiedades(descripcion)
+        if propiedades is not None:
+            registro = guardar_objeto(descripcion, propiedades=propiedades)
+        else:
+            print(f"[objetos] Geometría OK (paramétrico), pero fallaron las propiedades de '{descripcion}'.")
+        if callback_propiedades:
+            callback_propiedades(descripcion, registro if propiedades is not None else None)
+        print(f"[objetos] === '{descripcion}' terminado (camino: paramétrico) ===")
+        return registro
 
     # 2) Recién ahora se pide la ficha de propiedades físicas del MISMO objeto,
     # sea cual sea el camino de geometría de arriba.

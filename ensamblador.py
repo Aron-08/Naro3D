@@ -25,6 +25,8 @@ interna del objeto en su propio espacio local (ver sección 12 del plan:
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from dataclasses import dataclass, field
 
 import malla as malla_mod
@@ -73,6 +75,12 @@ class Parte:
     dims_cm: dict                   # claves dependen de la forma (ver _CLAVES_POR_FORMA)
     contacto: str | None = None     # "toca:<lado_propio>=<lado_otro>:<Parte>" |
                                      # "simetrica_a:<Parte>" | None
+    operacion: str = "union"        # "union" (default, se fusiona como sólido) |
+                                     # "resta" (Fase 5: se resta de la parte que
+                                     # referencia `contacto` — ver _aplicar_booleanas).
+                                     # Una Parte con operacion="resta" DEBE tener
+                                     # contacto="toca:...:<Objetivo>" (define dónde
+                                     # se posiciona el hueco antes de restarlo).
     color: str | None = None
     notas: str = ""
 
@@ -88,6 +96,17 @@ class Parte:
                 f"Parte '{self.nombre}' (forma={self.forma}) no trae las claves "
                 f"obligatorias {faltantes} en dims_cm."
             )
+        if self.operacion not in ("union", "resta"):
+            raise ErrorEnsamble(
+                f"Parte '{self.nombre}': operacion '{self.operacion}' inválida "
+                f"(debe ser 'union' o 'resta')."
+            )
+        if self.operacion == "resta" and (self.contacto is None or not self.contacto.startswith("toca:")):
+            raise ErrorEnsamble(
+                f"Parte '{self.nombre}' tiene operacion='resta' pero su contacto "
+                f"no es un 'toca:...' — una resta necesita saber contra qué parte "
+                f"y en qué cara se posiciona el hueco antes de restarlo."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -102,12 +121,20 @@ if _PYDANTIC_DISPONIBLE:
         forma: str
         dims_cm: dict
         contacto: str | None = None
+        operacion: str = "union"
 
         @field_validator("forma")
         @classmethod
         def _forma_valida(cls, v):
             if v not in FORMAS_VALIDAS:
                 raise ValueError(f"forma '{v}' no está en el catálogo cerrado")
+            return v
+
+        @field_validator("operacion")
+        @classmethod
+        def _operacion_valida(cls, v):
+            if v not in ("union", "resta"):
+                raise ValueError(f"operacion '{v}' inválida (debe ser 'union' o 'resta')")
             return v
 
         @field_validator("dims_cm")
@@ -143,7 +170,8 @@ if _PYDANTIC_DISPONIBLE:
             return None
         try:
             return [
-                Parte(nombre=p.nombre, forma=p.forma, dims_cm=p.dims_cm, contacto=p.contacto)
+                Parte(nombre=p.nombre, forma=p.forma, dims_cm=p.dims_cm,
+                      contacto=p.contacto, operacion=p.operacion)
                 for p in comp.partes
             ]
         except ErrorEnsamble:
@@ -304,12 +332,115 @@ def _orden_topologico(partes: list[Parte]) -> list[Parte]:
     return [por_nombre[n] for n in resueltas]
 
 
+# ---------------------------------------------------------------------------
+# 6.5 (Fase 5) — Operaciones booleanas reales (resta) sobre el ensamble
+# ---------------------------------------------------------------------------
+# Motivación (ver plan_kernel_parametrico.md, Fase 5): hasta acá el
+# "ensamble" es una unión visual (concatenar mallas) — suficiente para la
+# mayoría de los objetos, pero insuficiente para huecos reales (una ventana
+# en una pared, un agujero pasante en una brida). Esta sección agrega una
+# resta booleana real, con topología robusta, vía trimesh + el backend
+# "manifold" (manifold3d, puro Python/C++ sin binario externo tipo Blender
+# u OpenSCAD). Es un post-proceso OPCIONAL: si trimesh o el backend no
+# están instalados, o la resta falla por cualquier motivo (mallas
+# degeneradas, no-manifold), se conserva el sólido original SIN el hueco y
+# se loguea un aviso — nunca se rompe la creación del objeto por esto
+# (mismo criterio de "nunca None en cadena" del resto del proyecto).
+
+def _malla_a_trimesh(malla: Malla, centro: tuple):
+    """Malla local + centro -> trimesh.Trimesh en coordenadas absolutas del
+    ensamble (se le suma el centro antes de construir el trimesh, así la
+    operación booleana ve ambas mallas ya en el mismo sistema).
+
+    Las fábricas de `malla.py` no garantizan volumen positivo (el signo del
+    winding depende de cómo se listaron los vértices de cada cara, y varía
+    entre `malla_cubo`/`malla_esfera`/etc.) — `trimesh.boolean` exige mallas
+    "is_volume" (watertight, winding consistente Y volumen positivo), así
+    que acá se invierte la malla si hace falta antes de devolverla."""
+    import trimesh
+    cx, cy, cz = centro
+    vertices = [(x + cx, y + cy, z + cz) for x, y, z in malla.vertices]
+    tm = trimesh.Trimesh(vertices=vertices, faces=malla.caras, process=True)
+    if tm.volume < 0:
+        tm.invert()
+    return tm
+
+
+def _trimesh_a_malla(tm) -> Malla:
+    vertices = [tuple(float(c) for c in v) for v in tm.vertices]
+    caras = [tuple(int(i) for i in f) for f in tm.faces]
+    return Malla(vertices=vertices, caras=caras)
+
+
+def _restar_trimesh(malla_objetivo: Malla, centro_objetivo: tuple,
+                     malla_resta: Malla, centro_resta: tuple) -> "Malla | None":
+    """malla_objetivo - malla_resta, con topología real (no un truco visual).
+    Devuelve la Malla resultante YA en coordenadas absolutas del ensamble
+    (ver `_aplicar_booleanas`, que resetea el centro a (0,0,0) para no
+    aplicar el offset dos veces), o None si no se pudo (backend ausente,
+    mallas no-manifold, resultado vacío)."""
+    try:
+        import trimesh
+    except ImportError:
+        return None
+    try:
+        tm_objetivo = _malla_a_trimesh(malla_objetivo, centro_objetivo)
+        tm_resta = _malla_a_trimesh(malla_resta, centro_resta)
+        resultado_tm = trimesh.boolean.difference([tm_objetivo, tm_resta], engine="manifold")
+        if resultado_tm is None or len(resultado_tm.vertices) == 0 or len(resultado_tm.faces) == 0:
+            return None
+        return _trimesh_a_malla(resultado_tm)
+    except Exception as e:
+        print(f"[ensamblador][fase5] Resta booleana falló ({e}); se conserva el sólido original.")
+        return None
+
+
+def _aplicar_booleanas(resultado: dict[str, tuple], partes: list[Parte]) -> dict[str, tuple]:
+    """Post-procesa `resultado` (salida cruda del bucle de `resolver_ensamble`,
+    con TODAS las partes, incluidas las de `operacion='resta'`) aplicando
+    cada resta contra la parte que su `contacto` referencia. Las partes de
+    `operacion='resta'` se sacan del dict final: son huecos, no sólidos, y
+    no deben pasar por `fusionar_ensamble` como una pieza más."""
+    restas = [p for p in partes if p.operacion == "resta"]
+    if not restas:
+        return resultado
+
+    resultado_final = dict(resultado)
+    for parte_resta in restas:
+        _lado_propio, _lado_otro, nombre_obj = _parsear_contacto_toca(parte_resta.contacto)
+        if nombre_obj not in resultado_final or parte_resta.nombre not in resultado_final:
+            # La parte objetivo ya pudo haber sido consumida por otra resta
+            # previa en un ensamble con varios huecos encadenados — se
+            # ignora esta resta puntual en vez de abortar todo el objeto.
+            resultado_final.pop(parte_resta.nombre, None)
+            continue
+
+        malla_resta, centro_resta = resultado_final[parte_resta.nombre]
+        malla_obj, centro_obj = resultado_final[nombre_obj]
+
+        malla_nueva = _restar_trimesh(malla_obj, centro_obj, malla_resta, centro_resta)
+        if malla_nueva is None:
+            print(f"[ensamblador][fase5] No se pudo aplicar la resta '{parte_resta.nombre}' "
+                  f"sobre '{nombre_obj}'; se conserva '{nombre_obj}' sólido, sin el hueco.")
+        else:
+            # La malla nueva ya está en coordenadas absolutas del ensamble
+            # (se sumaron los centros antes de restar); el centro vuelve a
+            # (0,0,0) para que fusionar_ensamble no aplique el offset de nuevo.
+            resultado_final[nombre_obj] = (malla_nueva, (0.0, 0.0, 0.0))
+
+        resultado_final.pop(parte_resta.nombre, None)   # el hueco nunca se fusiona como sólido
+
+    return resultado_final
+
+
 def resolver_ensamble(partes: list[Parte]) -> dict[str, tuple[Malla, tuple]]:
     """Devuelve {nombre: (malla, centro_cm)} con todas las restricciones de
-    contacto/simetría resueltas exactamente. Nunca le pide nada al LLM —
-    esta función es 100% determinística y, dadas las mismas `partes`,
-    siempre produce exactamente el mismo resultado (ver tests en
-    tests/test_ensamblador.py)."""
+    contacto/simetría resueltas exactamente, y con las restas booleanas de
+    la Fase 5 ya aplicadas (las partes con operacion='resta' NO aparecen en
+    el resultado final: son huecos, no sólidos — ver `_aplicar_booleanas`).
+    Nunca le pide nada al LLM — esta función es 100% determinística y,
+    dadas las mismas `partes`, siempre produce exactamente el mismo
+    resultado (ver tests en tests/test_ensamblador.py)."""
     if not partes:
         raise ErrorEnsamble("resolver_ensamble() recibió una lista vacía de partes.")
 
@@ -326,7 +457,21 @@ def resolver_ensamble(partes: list[Parte]) -> dict[str, tuple[Malla, tuple]]:
         elif parte.contacto.startswith("toca:"):
             lado_propio, lado_otro, nombre_otra = _parsear_contacto_toca(parte.contacto)
             malla_otra, centro_otra = resultado[nombre_otra]   # ya resuelta por _orden_topologico
-            centro = _anclar_contacto(malla, malla_otra, centro_otra, lado_propio, lado_otro)
+            if parte.operacion == "resta":
+                # Una resta (hueco) tiene que quedar EMBEBIDA en el sólido
+                # objetivo para que la diferencia booleana corte algo real
+                # (a diferencia de una unión, donde "toca" adosa una pieza
+                # por FUERA de otra). Se centra exactamente en el objetivo
+                # — el `lado` sigue siendo obligatorio en el formato (para
+                # que el LLM piense "en qué cara va" y sea consistente con
+                # el resto del vocabulario de contacto), pero acá solo se
+                # usa para validar que sea un lado reconocido; la posición
+                # real es el centro del objetivo, y quien define la Parte
+                # debe darle a la resta dimensiones que atraviesen el
+                # espesor del objetivo en ese eje (ver Fase 5 del plan).
+                centro = centro_otra
+            else:
+                centro = _anclar_contacto(malla, malla_otra, centro_otra, lado_propio, lado_otro)
 
         elif parte.contacto.startswith("simetrica_a:"):
             nombre_otra = parte.contacto.split(":", 1)[1].strip()
@@ -338,7 +483,7 @@ def resolver_ensamble(partes: list[Parte]) -> dict[str, tuple[Malla, tuple]]:
 
         resultado[parte.nombre] = (malla, centro)
 
-    return resultado
+    return _aplicar_booleanas(resultado, partes)
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +532,182 @@ def ensamblar_partes(partes: list[Parte]) -> Malla:
     EntornoVirtual.agregar_figura_desde_malla()."""
     resultado = resolver_ensamble(partes)
     return fusionar_ensamble(resultado)
+
+
+# ---------------------------------------------------------------------------
+# Red de seguridad determinística (Python puro, SIN LLM) — ver "no debe caer
+# al sistema anterior": después de agotar los reintentos con el modelo
+# (objetos.py::generar_geometria_parametrica), este es el piso final. No es
+# "el sistema anterior" (ia_interprete.generar_figura, coordenadas de escena
+# escritas por un LLM) — es una plantilla NUEVA, propia del kernel
+# paramétrico, que sigue produciendo una Malla real con contactos exactos
+# por construcción (mismo camino que resolver_ensamble para todo el resto
+# del proyecto: geometría auditable, radio_bounding coherente, etc.).
+# Mismo espíritu que el viejo `TEMPLATES` de ia_interprete.py / la
+# `plantilla_seguridad` de generar_figura, pero expresado en `Parte`s.
+# ---------------------------------------------------------------------------
+
+def _plantilla_caja() -> list[Parte]:
+    return [Parte("Cuerpo", "caja", {"ancho": 35, "alto": 35, "profundo": 35})]
+
+
+def _plantilla_silla() -> list[Parte]:
+    return [
+        Parte("Asiento", "caja", {"ancho": 45, "alto": 5, "profundo": 45}),
+        Parte("Respaldo", "caja", {"ancho": 45, "alto": 45, "profundo": 5},
+              contacto="toca:abajo=arriba:Asiento"),
+        Parte("Pata_1", "cilindro", {"radio": 2, "alto": 45}, contacto="toca:arriba=abajo:Asiento"),
+        Parte("Pata_2", "cilindro", {"radio": 2, "alto": 45}, contacto="simetrica_a:Pata_1"),
+    ]
+
+
+def _plantilla_mesa() -> list[Parte]:
+    return [
+        Parte("Tapa", "caja", {"ancho": 120, "alto": 4, "profundo": 70}),
+        Parte("Pata_1", "cilindro", {"radio": 3, "alto": 72}, contacto="toca:arriba=abajo:Tapa"),
+        Parte("Pata_2", "cilindro", {"radio": 3, "alto": 72}, contacto="simetrica_a:Pata_1"),
+    ]
+
+
+def _plantilla_cama() -> list[Parte]:
+    return [
+        Parte("Base", "caja", {"ancho": 140, "alto": 30, "profundo": 200}),
+        Parte("Colchon", "caja", {"ancho": 135, "alto": 20, "profundo": 195},
+              contacto="toca:abajo=arriba:Base"),
+    ]
+
+
+def _plantilla_casa() -> list[Parte]:
+    return [
+        Parte("Cuerpo", "caja", {"ancho": 500, "alto": 280, "profundo": 400}),
+        Parte("Techo", "prisma_triangular", {"ancho": 520, "alto": 150, "profundo": 420},
+              contacto="toca:abajo=arriba:Cuerpo"),
+    ]
+
+
+def _plantilla_estante() -> list[Parte]:
+    return [
+        Parte("Repisa_1", "caja", {"ancho": 80, "alto": 3, "profundo": 25}),
+        Parte("Repisa_2", "caja", {"ancho": 80, "alto": 3, "profundo": 25},
+              contacto="toca:abajo=arriba:Repisa_1"),
+        Parte("Lateral_1", "caja", {"ancho": 3, "alto": 60, "profundo": 25},
+              contacto="toca:derecha=izquierda:Repisa_1"),
+        Parte("Lateral_2", "caja", {"ancho": 3, "alto": 60, "profundo": 25},
+              contacto="simetrica_a:Lateral_1"),
+    ]
+
+
+def _plantilla_puerta() -> list[Parte]:
+    return [Parte("Hoja", "caja", {"ancho": 80, "alto": 200, "profundo": 4})]
+
+
+def _plantilla_auto() -> list[Parte]:
+    return [
+        Parte("Carroceria", "caja", {"ancho": 180, "alto": 50, "profundo": 90}),
+        Parte("Rueda_1", "cilindro", {"radio": 20, "alto": 15}, contacto="toca:abajo=arriba:Carroceria"),
+        Parte("Rueda_2", "cilindro", {"radio": 20, "alto": 15}, contacto="simetrica_a:Rueda_1"),
+    ]
+
+
+def _plantilla_tuberia() -> list[Parte]:
+    return [Parte("Cano", "tubo", {"radio_externo": 5, "radio_interno": 4, "alto": 100})]
+
+
+# palabra_clave -> función que arma la lista de Partes (fresca cada vez, para
+# no compartir dicts mutables de dims_cm entre llamadas sucesivas).
+PLANTILLAS_PARAMETRICAS: dict = {
+    "silla": _plantilla_silla,
+    "banco": _plantilla_silla,
+    "taburete": _plantilla_silla,
+    "mesa": _plantilla_mesa,
+    "escritorio": _plantilla_mesa,
+    "cama": _plantilla_cama,
+    "casa": _plantilla_casa,
+    "hogar": _plantilla_casa,
+    "vivienda": _plantilla_casa,
+    "cabana": _plantilla_casa,
+    "estante": _plantilla_estante,
+    "repisa": _plantilla_estante,
+    "biblioteca": _plantilla_estante,
+    "puerta": _plantilla_puerta,
+    "auto": _plantilla_auto,
+    "carro": _plantilla_auto,
+    "coche": _plantilla_auto,
+    "vehiculo": _plantilla_auto,
+    "cano": _plantilla_tuberia,
+    "tuberia": _plantilla_tuberia,
+    "caja": _plantilla_caja,
+    "cubo": _plantilla_caja,
+    "dado": _plantilla_caja,
+    "bloque": _plantilla_caja,
+}
+
+
+def _normalizar_para_busqueda(texto: str) -> str:
+    texto = texto.lower().strip()
+    return "".join(c for c in unicodedata.normalize("NFD", texto) if unicodedata.category(c) != "Mn")
+
+
+def buscar_plantilla_parametrica(descripcion: str):
+    """Busca una plantilla determinística por palabra clave (sin LLM),
+    análogo a `ia_interprete._buscar_plantilla` pero devolviendo `Parte`s
+    del kernel paramétrico en vez de puntos/primitivas de escena. Es el
+    penúltimo escalón de la red de seguridad de
+    `objetos.py::generar_geometria_parametrica`: se prueba DESPUÉS de que
+    todos los reintentos con el LLM fallaron, y ANTES de la caja genérica
+    (`_plantilla_caja`), que es el piso absoluto. Devuelve `list[Parte] | None`."""
+    desc_norm = _normalizar_para_busqueda(descripcion)
+    for clave, fabrica in PLANTILLAS_PARAMETRICAS.items():
+        if re.search(r"\b" + re.escape(clave) + r"\b", desc_norm):
+            return fabrica()
+    return None
+
+
+def plantilla_generica_de_piso() -> list[Parte]:
+    """Piso absoluto: una caja genérica. Nunca falla, nunca depende del LLM
+    ni del pipeline viejo — es la garantía dura de que
+    `generar_geometria_parametrica` siempre devuelve una Malla real."""
+    return _plantilla_caja()
+
+
+# ---------------------------------------------------------------------------
+# Diagnóstico de la Malla final (sección 8.1 del plan) — a diferencia de
+# `geometria.py` (pensado para el contorno 2D puntos/conexiones del viejo
+# fallback LLM), el kernel paramétrico produce directamente una Malla 3D de
+# vértices+caras, así que el chequeo relevante es watertight/manifold, no
+# "contorno cerrado". Nunca corrige nada — solo alerta si algo salió mal
+# (señal de un bug real en `ensamblador.py`, no de un LLM alucinando
+# coordenadas, ya que esta geometría nace exacta por construcción)."""
+
+def diagnosticar_malla_cm(malla) -> list[str]:
+    """Devuelve una lista de advertencias (vacía si todo está bien). Nunca
+    lanza ni modifica `malla`: es de solo lectura, igual filosofía que
+    `geometria.validar_y_corregir_geometria(..., solo_diagnostico=True)`
+    pero aplicada a una Malla 3D en vez de un contorno 2D."""
+    advertencias: list[str] = []
+    if malla.num_vertices() == 0:
+        advertencias.append("  [diagnóstico] Malla vacía (0 vértices) — inesperado, revisar ensamblador.py")
+        return advertencias
+    try:
+        import trimesh
+    except ImportError:
+        advertencias.append("  [diagnóstico] trimesh no disponible; se omite el chequeo watertight/manifold.")
+        return advertencias
+    try:
+        tm = trimesh.Trimesh(vertices=malla.vertices, faces=malla.caras, process=True)
+        if not tm.is_watertight:
+            advertencias.append(
+                "  [diagnóstico] Malla no watertight (tiene bordes abiertos) — inesperado en "
+                "geometría paramétrica, revisar ensamblador.py"
+            )
+        if not tm.is_winding_consistent:
+            advertencias.append(
+                "  [diagnóstico] Winding de caras inconsistente — inesperado en geometría "
+                "paramétrica, revisar ensamblador.py"
+            )
+    except Exception as e:
+        advertencias.append(f"  [diagnóstico] No se pudo evaluar la malla con trimesh: {e}")
+    return advertencias
 
 
 if __name__ == "__main__":
