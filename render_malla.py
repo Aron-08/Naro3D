@@ -13,14 +13,6 @@ import cv2
 import numpy as np
 
 
-def _fill_poly_alpha(panel, polygon, color, alpha=0.28):
-    if polygon is None or len(polygon) < 3:
-        return
-    overlay = panel.copy()
-    cv2.fillPoly(overlay, [polygon], color)
-    cv2.addWeighted(overlay, alpha, panel, 1.0 - alpha, 0, dst=panel)
-
-
 def dibujar_malla(panel, malla, centro, proyector, color, alpha=0.28, grosor_arista=1):
     """Dibuja `malla` (vértices locales, sin transformar) ubicada en
     `centro` (x,y,z mundo), con `proyector` (mismo (x,y,z) -> ((sx,sy),
@@ -47,9 +39,22 @@ def dibujar_malla(panel, malla, centro, proyector, color, alpha=0.28, grosor_ari
             key=lambda cara: sum(z_vals[i] for i in cara) / len(cara),
             reverse=True,
         )
+        # Antes: un panel.copy() + cv2.addWeighted POR CADA cara (vía
+        # _fill_poly_alpha) — con mallas de cientos/miles de caras eso
+        # multiplicaba el costo de dibujar por una copia completa del panel
+        # (960x720) por triángulo, y era la causa principal de fps por el
+        # piso con objetos sin decimar (ver optimizacion_objetos.py).
+        # Ahora: un solo overlay para TODA la malla — cada cara se rellena
+        # ahí (fillPoly solo toca los píxeles del triángulo, no del panel
+        # entero) respetando el orden de profundidad ya calculado, y se
+        # hace UN ÚNICO blend al final. Resultado visual equivalente (la
+        # cara más cercana en cada píxel queda arriba) a una fracción del costo.
+        overlay = panel.copy()
         for cara in caras_ordenadas:
             poly = np.array([puntos2d[i] for i in cara], dtype=np.int32)
-            _fill_poly_alpha(panel, poly, color, alpha)
+            if len(poly) >= 3:
+                cv2.fillPoly(overlay, [poly], color)
+        cv2.addWeighted(overlay, alpha, panel, 1.0 - alpha, 0, dst=panel)
 
     if malla.aristas:
         edge_color = tuple(max(0, int(c * 0.75)) for c in color)

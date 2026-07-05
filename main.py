@@ -11,6 +11,7 @@ from entorno_virtual import EntornoVirtual
 import objetos as obj
 import ubicacion       # crear_objeto orquesta geometría → propiedades en secuencia
 import editor_visual    # panel para editar propiedades físicas, color y escala
+import optimizacion_objetos as opt_obj  # calidad dinámica en tiempo real (ver módulo)
 import malla as malla_module  # Malla.from_dict() para reconstruir mallas de biblioteca/IA (PLAN_RECONSTRUCCION_MALLAS.md)
 from ui_thread import en_hilo_ui  # tkinter no es thread-safe: ver ui_thread.py
 
@@ -195,6 +196,12 @@ NOMBRES_DEDOS = ["Pulgar", "Índice", "Medio", "Anular", "Meñique"]
 PANEL_W, PANEL_H = 960, 720
 
 entorno = EntornoVirtual(PANEL_W, PANEL_H)
+
+# Calidad dinámica: baja/sube el LOD de las figuras con Malla real según los
+# fps reales del bucle (ver optimizacion_objetos.py). No decima nada en
+# caliente, solo elige entre los LOD ya precalculados al crear/optimizar
+# cada objeto — costo despreciable de llamar cada frame.
+gestor_calidad = opt_obj.GestorCalidadDinamica()
 
 # --- vision3d: head tracking + proyección fuera de eje + estéreo anaglifo ---
 # Ver vision3d.py para el detalle. calibracion_pantalla tiene valores por
@@ -930,10 +937,19 @@ while True:
     # CLAHE + MediaPipe + dibujo), útil para verificar que las optimizaciones
     # de arriba realmente están subiendo los FPS en este equipo en particular.
     _t_actual = time.time()
-    _fps = 1.0 / max(_t_actual - _t_anterior, 1e-6)
+    _dt = _t_actual - _t_anterior
+    _fps = 1.0 / max(_dt, 1e-6)
     _t_anterior = _t_actual
     cv2.putText(frame, f"FPS: {_fps:4.1f}", (PANEL_W - 130, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+    # Calidad dinámica: se alimenta con el dt real de este frame y, si el
+    # nivel cambió, reasigna las mallas de las figuras antes de dibujar
+    # (ver sincronizar_calidad_entorno — no decima nada acá, solo elige).
+    gestor_calidad.registrar_frame(_dt)
+    opt_obj.sincronizar_calidad_entorno(entorno, gestor_calidad)
+    cv2.putText(frame, f"Calidad: {gestor_calidad.nivel_actual}", (PANEL_W - 130, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 220, 255), 1)
 
     # Indicador visual de ghost mode en la esquina del frame de cámara
     if _en_ghost:

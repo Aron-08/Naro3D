@@ -1,3 +1,0 @@
-descripcion: casa
-prompt_expandido: Usa cubos apilados para los pisos, una terraza rectangular plana adelante y un techo aparte del cuerpo principal — nunca dibujes el techo como parte del mismo cubo del cuerpo.
-generado: 2026-07-04 15:42:06

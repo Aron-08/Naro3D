@@ -757,6 +757,43 @@ def generar_geometria_parametrica(descripcion: str) -> "tuple[object, float]":
     return _malla_a_radio_relativo(malla_cm)
 
 
+def _archivar_en_biblioteca(descripcion: str, malla_cm, malla_info: dict) -> None:
+    """Registra `malla_cm` en biblioteca_mallas/ (carpeta en disco: `_indice.json`
+    + `<slug>.json` con los LOD + `<slug>.stl` como respaldo/trazabilidad del
+    original sin decimar). Nunca lanza ni bloquea la creación del objeto: si
+    trimesh no está instalado o el export falla, se archiva igual sin el STL
+    (el JSON con la malla decimada alcanza para que biblioteca.buscar()
+    encuentre un HIT la próxima vez)."""
+    import os
+    import tempfile
+    ruta_stl_tmp = None
+    try:
+        try:
+            import trimesh
+            tm = trimesh.Trimesh(vertices=malla_cm.vertices, faces=malla_cm.caras, process=False)
+            fd, ruta_stl_tmp = tempfile.mkstemp(suffix=".stl")
+            os.close(fd)
+            tm.export(ruta_stl_tmp)
+        except ImportError:
+            print("[objetos] trimesh no disponible; se archiva sin el .stl de respaldo "
+                  "(el .json con la malla decimada sí queda guardado).")
+            ruta_stl_tmp = None
+        except Exception as e:
+            print(f"[objetos] No se pudo exportar el .stl de respaldo de '{descripcion}': {e}")
+            ruta_stl_tmp = None
+
+        biblioteca.registrar_nueva(descripcion, malla_info, origen="parametrico_kernel",
+                                    ruta_stl_original=ruta_stl_tmp)
+    except Exception as e:
+        print(f"[objetos] No se pudo archivar '{descripcion}' en biblioteca_mallas/: {e}")
+    finally:
+        if ruta_stl_tmp and os.path.exists(ruta_stl_tmp):
+            try:
+                os.remove(ruta_stl_tmp)
+            except OSError:
+                pass
+
+
 def _malla_a_radio_relativo(malla_cm) -> "tuple[object, float]":
     """cm -> relativo [0,1] de escena: PX_POR_CM da píxeles de panel por cm
     (definido una sola vez en malla.py, ver sección 5.2 del plan); se
@@ -817,6 +854,23 @@ def crear_objeto(descripcion: str, callback_figura=None, callback_propiedades=No
     objeto queda en el entorno, solo que sin ficha física todavía (se puede regenerar
     después con "Actualizar con IA" en el panel).
     """
+    # -1) Si el objeto YA existe en el catálogo (objetos_db.json), reusarlo
+    # tal cual en vez de volver a generar geometría + propiedades. Antes
+    # crear_objeto() nunca chequeaba esto: cada vez que se pedía el mismo
+    # nombre se disparaba el pipeline entero (incluido el LLM) de nuevo, aun
+    # cuando ya había un registro completo guardado. Esto es lo que hacía
+    # que "no se guardaran" los objetos a los ojos del usuario — sí se
+    # guardaban en disco, pero nunca se leían de vuelta.
+    registro_existente = cargar_objeto(descripcion)
+    if registro_existente and registro_existente.get("figura") and registro_existente.get("propiedades"):
+        print(f"[objetos] '{descripcion}' ya existe en el catálogo; se reutiliza sin regenerar "
+              f"(creado {registro_existente.get('creado', '?')}).")
+        if callback_figura:
+            callback_figura(descripcion, registro_existente)
+        if callback_propiedades:
+            callback_propiedades(descripcion, registro_existente)
+        return registro_existente
+
     print(f"[objetos] === Creando objeto '{descripcion}' (geometría → propiedades) ===")
 
     # 0) Biblioteca primero: HIT = Malla real de una, sin tocar el modelo
@@ -857,12 +911,36 @@ def crear_objeto(descripcion: str, callback_figura=None, callback_propiedades=No
         for aviso in ens.diagnosticar_malla_cm(malla_cm):
             print(f"[objetos][ensamblador]{aviso}")
 
+        # Antes esto serializaba malla_cm directo, sin ningún tope de caras
+        # — a diferencia de biblioteca_mallas.py/malla_ia_async.py, que
+        # siempre decimaban antes de guardar. Un objeto con varias partes
+        # (cilindros, tubos, uniones booleanas) podía terminar con miles de
+        # caras, y render_malla hace un blend de panel completo por cara:
+        # esa combinación es la que hundía los fps (ver optimizacion_objetos.py).
+        try:
+            malla_lod_bajo = opt.decimar(malla_cm, opt.LOD_BAJO)
+            malla_lod_alto = opt.decimar(malla_cm, opt.LOD_ALTO)
+        except ImportError as e:
+            print(f"[objetos][paramétrico] No se pudo decimar ({e}); se guarda sin decimar.")
+            malla_lod_bajo, malla_lod_alto = malla_cm, None
+
         figura = _figura_placeholder_desde_malla(radio_bounding_relativo)
         malla_info = opt.serializar_json(
-            descripcion, malla_cm, None, origen="parametrico_kernel",
+            descripcion, malla_lod_bajo, malla_lod_alto, origen="parametrico_kernel",
             radio_bounding=radio_bounding_relativo,
         )
         registro = guardar_objeto(descripcion, figura=figura, malla=malla_info)
+
+        # Archivar en biblioteca_mallas/ (STL + JSON en disco, con embedding
+        # en el índice) — antes SOLO malla_ia_async.py y precargar_stl_curados
+        # llamaban a registrar_nueva(); el camino paramétrico (que hoy es el
+        # camino PRINCIPAL de geometría) nunca lo hacía, así que un objeto
+        # parecido pedido después SIEMPRE era un MISS de biblioteca y volvía
+        # a pasar por el LLM + ensamblador de cero. Con esto queda un
+        # registro persistente y reusable por similitud semántica, no solo
+        # por nombre exacto (que ya cubre el chequeo de arriba).
+        _archivar_en_biblioteca(descripcion, malla_cm, malla_info)
+
         if callback_figura:
             callback_figura(descripcion, registro)
         propiedades = generar_propiedades(descripcion)
