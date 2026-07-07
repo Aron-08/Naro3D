@@ -522,5 +522,3 @@ Construido sobre:
 - [trimesh](https://trimesh.org/) / [manifold3d](https://github.com/elalish/manifold) — geometría y booleanas 3D
 - [TripoSR](https://github.com/VAST-AI-Research/TripoSR) — generación de malla desde imagen
 - [OpenCV](https://opencv.org/) — captura y render 2D
-
-Definir licencia de distribución antes de publicar el repositorio públicamente.
