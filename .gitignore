@@ -1,20 +1,125 @@
-env/
-env-maz/
+# ==============================================================================
+# Naro Studio — .gitignore
+# ==============================================================================
 
+# ------------------------------------------------------------------------------
+# Python
+# ------------------------------------------------------------------------------
 __pycache__/
-*.pyc
-
-*.log
-*.tmp
-
-.vscode/
-.idea/
-
-.DS_Store
-Thumbs.db
-
-.env
-
-dist/
+*.py[cod]
+*$py.class
+*.so
+.Python
 build/
+dist/
 *.egg-info/
+.eggs/
+.installed.cfg
+*.egg
+
+# ------------------------------------------------------------------------------
+# Entornos virtuales
+# ------------------------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ------------------------------------------------------------------------------
+# Testing / cobertura
+# ------------------------------------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.cache/
+
+# ------------------------------------------------------------------------------
+# Cachés propias del proyecto (generadas en runtime — ver ia_interprete.py)
+# ------------------------------------------------------------------------------
+figuras_cache/
+prompts_expandidos_cache/
+
+# ------------------------------------------------------------------------------
+# Biblioteca de mallas y catálogo de objetos
+#
+# Estos archivos crecen automáticamente en cada sesión (mallas archivadas por
+# biblioteca_mallas.registrar_nueva(), catálogo persistido en objetos_db.json).
+# Decidí a conciencia si querés versionarlos:
+#
+#   - Si el repo es una DEMO con objetos ya curados que querés que cualquiera
+#     pueda clonar y probar tal cual -> comentá las líneas de abajo (no las
+#     ignores) para que queden trackeados.
+#   - Si son datos de tu sesión local de desarrollo (van a crecer con STL
+#     pesados y no aportan al código) -> dejalas descomentadas como están.
+# ------------------------------------------------------------------------------
+biblioteca_mallas/
+objetos_db.json
+editor_visual_estilos.json
+
+# ------------------------------------------------------------------------------
+# Editores / IDEs
+# ------------------------------------------------------------------------------
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+
+# ------------------------------------------------------------------------------
+# Sistema operativo
+# ------------------------------------------------------------------------------
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+*~
+.directory
+
+# ------------------------------------------------------------------------------
+# Modelos / pesos pesados descargados en runtime (SD-Turbo, TripoSR, torch hub)
+# Nunca deberían commitearse — se descargan al instalar las dependencias
+# opcionales (ver requirements.txt).
+# ------------------------------------------------------------------------------
+*.ckpt
+*.safetensors
+*.pt
+*.pth
+*.onnx
+.cache/huggingface/
+
+# ------------------------------------------------------------------------------
+# Archivos temporales de exportación 3D (STL de respaldo generados por
+# ensamblador.py / malla_ia_async.py con tempfile.mkstemp — no deberían
+# persistir, pero por si acaso queda alguno suelto)
+# ------------------------------------------------------------------------------
+*.stl
+!biblioteca_mallas/**/*.stl
+
+# ------------------------------------------------------------------------------
+# Variables de entorno / secretos (ANTHROPIC_API_KEY, etc.)
+# ------------------------------------------------------------------------------
+.env
+.env.local
+*.key
+
+# ------------------------------------------------------------------------------
+# Logs
+# ------------------------------------------------------------------------------
+*.log
+logs/
