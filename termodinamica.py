@@ -1,553 +1,492 @@
 """
-geometria.py — Auditoría y normalización topológica de figuras ya generadas
-por el pipeline de ia_interprete.py (paso 1/2/2b), antes de exportarlas a
-cad2d.py (BlockEntity) o a simulador_aerodinamico.py (contorno CFD).
+termodinamica.py — Comportamiento térmico de un objeto ya definido (geometría
++ material), pensado para conectar con objetos.py (ficha de propiedades) y,
+más adelante, con la experimentación de propulsión H2/O2 (combustión en
+punta de pala) y el LAES criogénico.
 
-Esta skill NO genera geometría nueva: audita la que ya salió validada de
-paso 2b y, cuando puede, la corrige de forma determinística (cerrar un
-contorno abierto, normalizar orientación para exportar). Si el problema es
-grave (auto-intersección, ramificación), no la corrige — devuelve
-`apto_para_destino=False` para que quien la llame decida si reintenta el
-paso 1 con un prompt más estricto.
+Filosofía (ver skill 04_skill_termodinamica.md, y skill 00 — filtro de
+ruido): el LLM NUNCA hace la cuenta de punta a punta. Se usa solo para elegir
+CRITERIO — qué modelo térmico aplica (concentrado vs. gradiente), si el
+proceso es físico o de combustión, y para redactar una advertencia corta en
+lenguaje natural. Toda la aritmética (Fourier, calorimetría, estequiometría)
+es Python puro con fórmulas de libro. Cualquier número que el modelo intente
+meter en su "NOTA" se ignora — la nota es solo texto para mostrarle al
+usuario, nunca fuente de verdad numérica.
 
-Filosofía (ver skill 02_skill_geometria.md, y skill 00 — filtro de ruido):
-    - Todo lo topológico (contorno cerrado, orientación, auto-intersección,
-      área, perímetro, centroide) es matemática exacta: se resuelve 100% en
-      Python, nunca se le pregunta al modelo.
-    - El LLM se usa SOLO para clasificar semánticamente un mecanismo
-      (engranaje/polea/tornillo/genérico) cuando uso_destino="mecanismo",
-      porque eso no tiene una fórmula cerrada — es la única parte de esta
-      skill que no es puramente determinística.
+Unidades: SI en todo el módulo (kg, m, m2, m3, s, K/°C, J, W). La geometría
+del resto del proyecto vive en coordenadas de escena normalizadas [0,1]^3
+(ver ubicacion.py / geometria.py), que NO son metros — por eso el volumen del
+objeto se deriva de masa/densidad (peso_kg / densidad_kg_m3, ya presentes en
+la ficha de objetos.py), no del área de la figura en pantalla. Ver
+`geometria_termica_desde_ficha()`.
 
-Coordenadas: se trabaja en el plano (x,y) relativo [0,1] que ya usa el
-pipeline (z se ignora para topología — las figuras de este proyecto son
-wireframes casi planos; ver nota en ubicacion.py sobre el mismo tema).
+Requiere lo mismo que ia_interprete.py (Ollama corriendo + el modelo
+configurado).
 """
 
-import math
+import re
 
-import modelos   # modelo/temperatura de esta skill vienen de modelos_config.json ("geometria")
-from geo_utils import segmentos_cruzan as _segmentos_cruzan  # test de cruce: única
-                                                               # implementación, ver geo_utils.py
+from ia_interprete import _llamar_modelo   # reutiliza el wrapper de Ollama ya probado
 
 
 # ---------------------------------------------------------------------------
-# Constantes
+# Constantes físicas de referencia (fijas, NUNCA se le preguntan al modelo)
 # ---------------------------------------------------------------------------
 
-UMBRAL_CIERRE       = 0.05     # distancia máxima para cerrar automáticamente un contorno abierto
-AREA_MINIMA         = 0.0005   # por debajo de esto, la geometría se considera degenerada (colapsada)
-# La temperatura y el modelo de esta skill ahora se controlan desde
-# modelos_config.json (bloque "geometria"), no aca.
+CERO_ABSOLUTO_C          = -273.15   # °C, límite físico infranqueable
+PODER_CALORIFICO_H2_MJ_KG = 120.0    # MJ/kg, poder calorífico inferior del H2
+MASA_MOLAR_H2_G_MOL       = 2.016
+MASA_MOLAR_O2_G_MOL       = 31.998
+TEMP_LLAMA_H2O2_C_RANGO   = (2800.0, 3000.0)   # referencia estequiométrica, solo para contraste
 
+H_CONVECCION_AIRE_LIBRE_W_M2K = 10.0   # convección natural típica en aire quieto
+H_CONVECCION_AIRE_FORZADO_W_M2K = 40.0  # con ventilación/movimiento de aire
 
-# ---------------------------------------------------------------------------
-# Grafo de conexiones — grados, componentes
-# ---------------------------------------------------------------------------
+TEMPERATURA_TERMICA = 0.15   # baja: esta skill decide criterio, no crea contenido
 
-def _construir_grafo(conexiones: list, n_puntos: int) -> dict:
-    adyacencia = {i: [] for i in range(n_puntos)}
-    for i, j in conexiones:
-        if 0 <= i < n_puntos and 0 <= j < n_puntos and i != j:
-            adyacencia[i].append(j)
-            adyacencia[j].append(i)
-    return adyacencia
-
-
-def _grados(conexiones: list, n_puntos: int) -> list:
-    grados = [0] * n_puntos
-    for i, j in conexiones:
-        if 0 <= i < n_puntos and 0 <= j < n_puntos and i != j:
-            grados[i] += 1
-            grados[j] += 1
-    return grados
-
-
-def _detectar_componentes(adyacencia: dict, n_puntos: int) -> list:
-    """Componentes conexas del grafo (listas de índices de punto)."""
-    visitados = set()
-    componentes = []
-    for inicio in range(n_puntos):
-        if inicio in visitados:
-            continue
-        pila = [inicio]
-        comp = []
-        while pila:
-            u = pila.pop()
-            if u in visitados:
-                continue
-            visitados.add(u)
-            comp.append(u)
-            for v in adyacencia[u]:
-                if v not in visitados:
-                    pila.append(v)
-        componentes.append(comp)
-    return componentes
-
-
-def _ordenar_ciclo(adyacencia: dict, componente: list) -> list | None:
-    """Recorre un ciclo simple (todos los nodos de `componente` con grado 2
-    dentro del ciclo) y devuelve el orden de índices de punto al caminarlo.
-    Devuelve None si no es un ciclo simple recorrible (no debería pasar si
-    ya se filtró por grado==2, pero se protege igual)."""
-    if len(componente) < 3:
-        return None
-    inicio = componente[0]
-    orden = [inicio]
-    anterior = None
-    actual = inicio
-    for _ in range(len(componente) + 1):
-        vecinos = adyacencia[actual]
-        if len(vecinos) != 2:
-            return None
-        siguiente = vecinos[0] if vecinos[0] != anterior else vecinos[1]
-        if siguiente == inicio:
-            return orden if len(orden) == len(componente) else None
-        orden.append(siguiente)
-        anterior, actual = actual, siguiente
-    return None   # no cerró en la cantidad esperada de pasos: no es un ciclo simple
+# Plantillas de seguridad si falta un dato de material indispensable (nunca
+# se deja continuar con calor_especifico=0: eso rompe cualquier cuenta con
+# división, incluida Q = m*c*ΔT despejada para ΔT).
+_VALORES_SEGURIDAD_TERMICO = {
+    "metal_generico":    {"calor_especifico_j_kgk": 460,  "conductividad_termica_w_mk": 40},
+    "plastico_generico": {"calor_especifico_j_kgk": 1500, "conductividad_termica_w_mk": 0.3},
+    "mineral_generico":  {"calor_especifico_j_kgk": 900,  "conductividad_termica_w_mk": 1.3},
+    "organico_generico": {"calor_especifico_j_kgk": 1800, "conductividad_termica_w_mk": 0.15},
+}
 
 
 # ---------------------------------------------------------------------------
-# Área (shoelace), perímetro, centroide de un contorno ya ordenado
+# Geometría térmica: volumen y espesor característico, SIEMPRE en Python
 # ---------------------------------------------------------------------------
+# Nunca se le pide al LLM que estime volumen de una figura (skill 04). El
+# volumen sale de masa/densidad, que ya están resueltos por objetos.py; el
+# área expuesta (si se conoce) da un espesor característico más realista
+# (aproximación de placa delgada); si no se conoce, se usa la aproximación
+# de cuerpo compacto (cubo equivalente).
 
-def _area_shoelace(pts_orden: list) -> float:
-    """Área con signo (fórmula del zapatero). El signo depende del sentido
-    de recorrido — no representa una "orientación correcta/incorrecta" en sí
-    misma, solo indica si el recorrido usado va en un sentido u otro. Lo
-    importante para exportar es la CONSISTENCIA entre contornos, no el signo
-    en abstracto (ver contornos_para_exportar)."""
-    n = len(pts_orden)
-    s = 0.0
-    for i in range(n):
-        x1, y1 = pts_orden[i][0], pts_orden[i][1]
-        x2, y2 = pts_orden[(i + 1) % n][0], pts_orden[(i + 1) % n][1]
-        s += x1 * y2 - x2 * y1
-    return s / 2.0
+def geometria_termica_desde_ficha(peso_kg: float, densidad_kg_m3: float,
+                                   area_expuesta_m2: float | None = None) -> dict:
+    """Devuelve {"volumen_estimado_m3", "espesor_caracteristico_m", "area_expuesta_m2"}.
 
-
-def _perimetro(pts_orden: list) -> float:
-    n = len(pts_orden)
-    total = 0.0
-    for i in range(n):
-        x1, y1 = pts_orden[i][0], pts_orden[i][1]
-        x2, y2 = pts_orden[(i + 1) % n][0], pts_orden[(i + 1) % n][1]
-        total += math.hypot(x2 - x1, y2 - y1)
-    return total
-
-
-def _centroide_poligono(pts_orden: list, area_con_signo: float) -> tuple:
-    if abs(area_con_signo) < 1e-9:
-        xs = [p[0] for p in pts_orden]
-        ys = [p[1] for p in pts_orden]
-        return (sum(xs) / len(xs), sum(ys) / len(ys))
-    n = len(pts_orden)
-    cx = cy = 0.0
-    for i in range(n):
-        x1, y1 = pts_orden[i][0], pts_orden[i][1]
-        x2, y2 = pts_orden[(i + 1) % n][0], pts_orden[(i + 1) % n][1]
-        cruz = x1 * y2 - x2 * y1
-        cx += (x1 + x2) * cruz
-        cy += (y1 + y2) * cruz
-    factor = 1.0 / (6.0 * area_con_signo)
-    return (cx * factor, cy * factor)
-
-
-# ---------------------------------------------------------------------------
-# Auto-intersección (segmentos que se cruzan sin ser adyacentes)
-# ---------------------------------------------------------------------------
-
-# (test de orientación / cruce de segmentos: ver geo_utils.py, importado arriba)
-
-
-def detectar_autointerseccion(puntos: list, conexiones: list) -> list:
-    """Devuelve la lista de pares de índices de arista (en `conexiones`) que
-    se cruzan entre sí, ignorando pares que comparten un vértice (eso es
-    normal en un polígono, no es auto-intersección)."""
-    cruces = []
-    n = len(conexiones)
-    for a in range(n):
-        i1, j1 = conexiones[a]
-        for b in range(a + 1, n):
-            i2, j2 = conexiones[b]
-            if len({i1, j1, i2, j2}) < 4:
-                continue   # comparten un vértice: adyacentes, no cuenta
-            if _segmentos_cruzan(puntos[i1], puntos[j1], puntos[i2], puntos[j2]):
-                cruces.append((a, b))
-    return cruces
-
-
-# ---------------------------------------------------------------------------
-# Área / centroide aproximados cuando la figura es solo primitivas (sin puntos)
-# ---------------------------------------------------------------------------
-
-def _area_primitivas(primitivas: list) -> float:
-    total = 0.0
-    for p in primitivas:
-        tipo = p.get("tipo")
-        if tipo == "circulo":
-            total += math.pi * p["r"] ** 2
-        elif tipo == "rectangulo":
-            total += p["ancho"] * p["alto"]
-        elif tipo == "elipse":
-            total += math.pi * p["rx"] * p["ry"]
-        # esfera/cubo/cilindro son volúmenes 3D, no aportan "área de planta"
-        # directa comparable — se ignoran para este total 2D.
-    return total
-
-
-def _centroide_primitivas(primitivas: list) -> tuple:
-    if not primitivas:
-        return (0.5, 0.5)
-    xs, ys = [], []
-    for p in primitivas:
-        tipo = p.get("tipo")
-        if tipo == "rectangulo":
-            xs.append(p["x"] + p["ancho"] / 2)
-            ys.append(p["y"] + p["alto"] / 2)
-        else:
-            xs.append(p.get("cx", 0.5))
-            ys.append(p.get("cy", 0.5))
-    return (sum(xs) / len(xs), sum(ys) / len(ys))
-
-
-# ---------------------------------------------------------------------------
-# Auditoría principal
-# ---------------------------------------------------------------------------
-
-def auditar_geometria(figura: dict, uso_destino: str = "render_only") -> dict:
-    """Audita `figura` ({puntos, conexiones, primitivas}) y devuelve un
-    reporte completo. No modifica `figura`. `uso_destino` en
-    {"cfd", "mecanismo", "render_only"} — cfd/mecanismo exigen contorno
-    cerrado, sin ramificaciones y sin auto-intersección; render_only es
-    tolerante (una figura decorativa con un punto colgante igual se dibuja).
+    - volumen = masa / densidad (exacto, siempre que ambos sean > 0).
+    - espesor: si se conoce el área expuesta real, volumen / área (placa
+      delgada); si no, volumen**(1/3) (cubo equivalente) como aproximación
+      conservadora de cuerpo compacto.
     """
-    puntos = figura.get("puntos", [])
-    conexiones = figura.get("conexiones", [])
-    primitivas = figura.get("primitivas", [])
-    n = len(puntos)
-    correcciones: list = []
+    densidad = densidad_kg_m3 if densidad_kg_m3 and densidad_kg_m3 > 0 else 1000.0
+    masa = peso_kg if peso_kg and peso_kg > 0 else 0.001
+    volumen = masa / densidad
 
-    # --- Caso: solo primitivas, sin puntos/líneas ------------------------
-    # Círculos, rectángulos, etc. son inherentemente cerrados: no necesitan
-    # auditoría de contorno.
-    if n == 0:
-        return {
-            "cerrado": True,
-            "orientacion": None,
-            "auto_interseccion": False,
-            "cruces": [],
-            "area": _area_primitivas(primitivas),
-            "perimetro": None,
-            "centroide": _centroide_primitivas(primitivas),
-            "apto_para_destino": True,
-            "correcciones_aplicadas": [],
-            "conexiones_corregidas": conexiones,
-            "colgantes": [],
-            "ramificados": [],
-            "aislados": [],
-            "contornos": [],
-        }
-
-    # --- Grados de cada punto ---------------------------------------------
-    grados = _grados(conexiones, n)
-    colgantes = [i for i, g in enumerate(grados) if g == 1]
-    ramificados = [i for i, g in enumerate(grados) if g > 2]
-    aislados = [i for i, g in enumerate(grados) if g == 0]
-
-    conexiones_corregidas = list(conexiones)
-
-    # --- Intento de auto-cierre: solo el caso simple (exactamente 2 colgantes,
-    # sin ramificaciones) — si hay más de 2 o hay ramificación, no se adivina
-    # cuál cerrar, se deja para que decida el paso 2b/reintento de paso 1.
-    if len(colgantes) == 2 and not ramificados:
-        p1, p2 = colgantes
-        d = math.hypot(puntos[p1][0] - puntos[p2][0], puntos[p1][1] - puntos[p2][1])
-        if d < UMBRAL_CIERRE:
-            conexiones_corregidas.append([p1, p2])
-            correcciones.append(
-                f"  Contorno abierto: se agregó conexión P{p1}-P{p2} "
-                f"(distancia {d:.3f}) para cerrarlo."
-            )
-            grados = _grados(conexiones_corregidas, n)
-            colgantes = [i for i, g in enumerate(grados) if g == 1]
-
-    cerrado = (not colgantes) and (not ramificados) and (not aislados) and n >= 3
-
-    # --- Componentes y contornos ordenados ---------------------------------
-    adyacencia = _construir_grafo(conexiones_corregidas, n)
-    componentes = [c for c in _detectar_componentes(adyacencia, n) if c and set(c) - set(aislados)]
-
-    contornos = []   # cada uno: {"orden": [...], "puntos": [...], "area": float, "perimetro": float}
-    area_total = 0.0
-    perimetro_total = 0.0
-    cx_acum = cy_acum = peso_acum = 0.0
-
-    if cerrado:
-        for comp in componentes:
-            orden = _ordenar_ciclo(adyacencia, comp)
-            if orden is None:
-                cerrado = False   # componente no es un ciclo simple recorrible: audit falla
-                continue
-            pts_orden = [puntos[i] for i in orden]
-            area_c = _area_shoelace(pts_orden)
-            perim_c = _perimetro(pts_orden)
-            cxc, cyc = _centroide_poligono(pts_orden, area_c)
-            contornos.append({
-                "orden": orden, "puntos": pts_orden,
-                "area": area_c, "perimetro": perim_c, "centroide": (cxc, cyc),
-            })
-            area_total += abs(area_c)
-            perimetro_total += perim_c
-            cx_acum += cxc * abs(area_c)
-            cy_acum += cyc * abs(area_c)
-            peso_acum += abs(area_c)
-
-    if contornos and peso_acum > 0:
-        centroide = (cx_acum / peso_acum, cy_acum / peso_acum)
-        area = area_total
-        perimetro = perimetro_total
-        orientacion = "positiva" if contornos[0]["area"] > 0 else "negativa"
+    if area_expuesta_m2 and area_expuesta_m2 > 0:
+        espesor = volumen / area_expuesta_m2
+        area = area_expuesta_m2
     else:
-        xs = [p[0] for p in puntos]
-        ys = [p[1] for p in puntos]
-        centroide = (sum(xs) / len(xs), sum(ys) / len(ys))
-        area = None
-        perimetro = None
-        orientacion = None
-
-    # --- Auto-intersección (se chequea siempre, cerrado o no) --------------
-    cruces = detectar_autointerseccion(puntos, conexiones_corregidas)
-    auto_interseccion = len(cruces) > 0
-
-    area_degenerada = area is not None and abs(area) <= AREA_MINIMA
-
-    # --- Aptitud según destino ----------------------------------------------
-    if uso_destino in ("cfd", "mecanismo"):
-        apto = cerrado and not auto_interseccion and not area_degenerada
-    else:
-        apto = True   # render_only: se dibuja igual aunque no sea un contorno perfecto
+        espesor = volumen ** (1.0 / 3.0)
+        area = 6.0 * espesor ** 2   # superficie de un cubo equivalente, para h*A
 
     return {
-        "cerrado": cerrado,
-        "orientacion": orientacion,
-        "auto_interseccion": auto_interseccion,
-        "cruces": cruces,
-        "area": area,
-        "perimetro": perimetro,
-        "centroide": centroide,
-        "apto_para_destino": apto,
-        "correcciones_aplicadas": correcciones,
-        "conexiones_corregidas": conexiones_corregidas,
-        "colgantes": colgantes,
-        "ramificados": ramificados,
-        "aislados": aislados,
-        "contornos": contornos,
+        "volumen_estimado_m3": volumen,
+        "espesor_caracteristico_m": espesor,
+        "area_expuesta_m2": area,
     }
 
 
 # ---------------------------------------------------------------------------
-# Filtro de ruido / validación final (capa 3, ver skill 00)
+# Saneo de entrada (capa 1 del filtro de ruido — skill 00)
 # ---------------------------------------------------------------------------
 
-def validar_y_corregir_geometria(figura: dict, uso_destino: str = "render_only") -> tuple[dict, bool, list[str]]:
-    """Devuelve (figura_corregida, es_valida, advertencias).
-    `figura_corregida` solo difiere de `figura` en `conexiones` (por el
-    auto-cierre); nunca se tocan `puntos` ni `primitivas` — esta skill no
-    inventa coordenadas nuevas, solo cierra huecos triviales."""
-    reporte = auditar_geometria(figura, uso_destino)
-    advertencias = list(reporte["correcciones_aplicadas"])
-
-    if reporte["colgantes"]:
-        advertencias.append(f"  Puntos colgantes sin cerrar: {reporte['colgantes']} — violación grave")
-    if reporte["ramificados"]:
-        advertencias.append(f"  Puntos con más de 2 conexiones (ramificación): {reporte['ramificados']} — violación grave")
-    if reporte["aislados"]:
-        advertencias.append(f"  Puntos sin ninguna conexión: {reporte['aislados']} — violación grave")
-    if reporte["auto_interseccion"]:
-        advertencias.append(f"  Auto-intersección en aristas {reporte['cruces']} — violación grave")
-    if reporte["area"] is not None and abs(reporte["area"]) <= AREA_MINIMA:
-        advertencias.append(f"  Área degenerada ({reporte['area']:.5f}) — geometría casi colapsada")
-
-    figura_corregida = {
-        **figura,
-        "conexiones": reporte["conexiones_corregidas"],
-    }
-    return figura_corregida, reporte["apto_para_destino"], advertencias
+def _categoria_material(nombre_material: str) -> str:
+    """Heurística simple por palabras clave (mismo criterio que objetos.py
+    usa para defaults), solo para elegir plantilla de seguridad."""
+    texto = (nombre_material or "").lower()
+    if any(p in texto for p in ("acero", "aluminio", "cobre", "hierro", "metal", "bronce", "titanio")):
+        return "metal_generico"
+    if any(p in texto for p in ("plastico", "pvc", "abs", "pla", "nylon", "polimero")):
+        return "plastico_generico"
+    if any(p in texto for p in ("hormigon", "concreto", "piedra", "ceramico", "vidrio", "mineral")):
+        return "mineral_generico"
+    if any(p in texto for p in ("madera", "tela", "cuero", "papel", "organico")):
+        return "organico_generico"
+    return "mineral_generico"
 
 
-# ---------------------------------------------------------------------------
-# Exportación: contornos normalizados, listos para CAD/CFD
-# ---------------------------------------------------------------------------
+def _sanear_material(material: dict) -> dict:
+    """Nunca deja calor_especifico o conductividad en 0/negativo — eso rompe
+    cualquier cuenta térmica con división. Rellena con plantilla si falta."""
+    m = dict(material or {})
+    categoria = _categoria_material(m.get("material", ""))
+    plantilla = _VALORES_SEGURIDAD_TERMICO[categoria]
 
-def contornos_para_exportar(figura: dict, uso_destino: str = "cfd",
-                             orientacion_deseada: str = "positiva") -> list:
-    """Devuelve una lista de contornos cerrados, cada uno como lista de
-    (x,y) YA en el orden de recorrido correcto para exportar — normalizando
-    todos al mismo sentido (`orientacion_deseada`), para no repetir a mano
-    el fix de "eje Y invertido" cada vez que cambia el origen de la figura.
+    ce = m.get("calor_especifico_j_kgk")
+    if not ce or ce <= 0:
+        m["calor_especifico_j_kgk"] = plantilla["calor_especifico_j_kgk"]
 
-    No modifica la figura original. Si la geometría no es apta (auto-
-    intersección, contorno abierto), devuelve lista vacía — quien llama debe
-    chequear `validar_y_corregir_geometria` antes si quiere saber por qué.
-    """
-    reporte = auditar_geometria(figura, uso_destino)
-    if not reporte["apto_para_destino"]:
-        return []
+    k = m.get("conductividad_termica_w_mk")
+    if not k or k <= 0:
+        m["conductividad_termica_w_mk"] = plantilla["conductividad_termica_w_mk"]
 
-    resultado = []
-    for c in reporte["contornos"]:
-        pts = c["puntos"]
-        area_signo = c["area"]
-        va_al_reves = (
-            (orientacion_deseada == "positiva" and area_signo < 0) or
-            (orientacion_deseada == "negativa" and area_signo > 0)
+    if not m.get("densidad_kg_m3") or m["densidad_kg_m3"] <= 0:
+        m["densidad_kg_m3"] = 1000.0
+
+    return m
+
+
+def _sanear_temperatura_c(valor: float, defecto: float = 20.0) -> tuple[float, str | None]:
+    """Ninguna temperatura puede estar por debajo del cero absoluto — 0
+    tolerancia (ver skill 04, tabla de rangos). Devuelve (valor_saneado, aviso|None)."""
+    if valor is None:
+        return defecto, None
+    if valor < CERO_ABSOLUTO_C:
+        return CERO_ABSOLUTO_C, (
+            f"  Temperatura {valor}°C por debajo del cero absoluto — clampada a "
+            f"{CERO_ABSOLUTO_C}°C (violación grave de entrada)"
         )
-        resultado.append(list(reversed(pts)) if va_al_reves else list(pts))
-    return resultado
+    return valor, None
 
 
 # ---------------------------------------------------------------------------
-# Clasificación semántica de mecanismos (única parte con LLM)
+# Fórmulas de libro (Python puro, ver skill 04)
 # ---------------------------------------------------------------------------
 
-SYSTEM_CLASIFICAR_MECANISMO = """Clasificás la silueta de una pieza mecánica 2D ya generada, para saber
-qué tipo de mecanismo es. Recibís el contorno como lista de puntos (x,y) y el área/perímetro
-ya calculados. NO inventés coordenadas, solo clasificá.
+def numero_biot(h_w_m2k: float, espesor_caracteristico_m: float, k_w_mk: float) -> float:
+    """Bi = h * Lc / k. Bi < 0.1 -> aproximación de cuerpo concentrado válida."""
+    if k_w_mk <= 0:
+        return float("inf")
+    return h_w_m2k * espesor_caracteristico_m / k_w_mk
 
-Respondé ÚNICAMENTE con este formato, sin texto adicional:
 
-TIPO: <engranaje|polea|tornillo|husillo|generico>
-EJE: cx,cy
+def constante_tiempo_concentrado(masa_kg: float, calor_especifico_j_kgk: float,
+                                  h_w_m2k: float, area_expuesta_m2: float) -> float:
+    """tau = m*c / (h*A), en segundos. Cuanto mayor, más lento se estabiliza."""
+    denom = h_w_m2k * area_expuesta_m2
+    if denom <= 0:
+        return float("inf")
+    return (masa_kg * calor_especifico_j_kgk) / denom
+
+
+def temperatura_transitoria_concentrado(temp_ambiente_c: float, temp_inicial_c: float,
+                                         tiempo_s: float, tau_s: float) -> float:
+    """T(t) = T_amb + (T0 - T_amb) * exp(-t/tau) — cuerpo concentrado (lumped
+    capacitance), relajándose hacia la temperatura ambiente por convección."""
+    import math
+    if tau_s == float("inf") or tau_s <= 0:
+        return temp_inicial_c
+    return temp_ambiente_c + (temp_inicial_c - temp_ambiente_c) * math.exp(-tiempo_s / tau_s)
+
+
+def masa_o2_estequiometrica_kg(masa_h2_kg: float) -> float:
+    """2 H2 + O2 -> 2 H2O. Relación másica O2:H2 = M(O2) / (2*M(H2))."""
+    return masa_h2_kg * (MASA_MOLAR_O2_G_MOL / (2.0 * MASA_MOLAR_H2_G_MOL))
+
+
+def energia_combustion_h2_j(masa_h2_kg: float) -> float:
+    """Q = poder_calorifico_kg * masa_combustible_kg, en Joules."""
+    return PODER_CALORIFICO_H2_MJ_KG * 1e6 * masa_h2_kg
+
+
+def delta_temperatura_combustion(energia_j: float, masa_objeto_kg: float,
+                                  calor_especifico_j_kgk: float) -> float:
+    """ΔT = Q / (m_objeto * c). Asume toda la energía absorbida por el
+    objeto (cota superior conservadora — en la realidad hay pérdidas)."""
+    denom = masa_objeto_kg * calor_especifico_j_kgk
+    if denom <= 0:
+        return 0.0
+    return energia_j / denom
+
+
+# ---------------------------------------------------------------------------
+# Razonamiento guiado (única parte con LLM) — elegir criterio, no calcular
+# ---------------------------------------------------------------------------
+
+SYSTEM_TERMICO = """Analizás el comportamiento térmico de un objeto ya definido (geometría +
+material + condiciones de borde). NO hacés ninguna cuenta numérica: todo el cálculo
+(conducción de Fourier, calorimetría) ya lo hace Python con fórmulas exactas. Tu trabajo es
+elegir el CRITERIO correcto y, si corresponde, redactar una advertencia corta.
+
+Recibís un JSON con "geometria" (área, volumen, espesor característico), "material"
+(conductividad, calor específico, densidad, temperatura máxima de servicio) y "condiciones"
+(temperatura ambiente, temperatura de la fuente, tipo de proceso, modo).
+
+Respondé ÚNICAMENTE con este formato, un dato por línea, sin texto adicional:
+
+MODELO: <concentrado|gradiente>
+BIOT_ESTIMADO: <bajo|alto>
+PROCESO: <fisico|combustion>
+RIESGO: <ninguno|excede_temp_servicio|excede_punto_fusion>
+NOTA: una frase corta, opcional
 
 Reglas:
-  - "engranaje": contorno con muchos vértices regulares alrededor de un centro (dientes).
-  - "polea": contorno redondeado (muchos puntos formando un círculo/anillo), sin dientes.
-  - "tornillo"/"husillo": contorno alargado con un patrón repetitivo a lo largo de un eje.
-  - "generico": cualquier otra silueta mecánica que no encaje claramente en las anteriores.
-  - EJE es el centro de rotación/simetría de la pieza — normalmente coincide con el centroide
-    que ya te paso, salvo que la silueta sea claramente asimétrica respecto de él.
+  - MODELO "concentrado" (cuerpo a temperatura uniforme) es correcto casi siempre que el
+    objeto sea chico o metálico (buena conductividad); "gradiente" solo si el objeto es
+    grande y mal conductor Y el modo pedido es explícitamente espacial.
+  - BIOT_ESTIMADO "bajo" acompaña a MODELO concentrado, "alto" acompaña a gradiente.
+  - PROCESO "combustion" solo si tipo_proceso menciona combustión/H2/O2/quemado; si no,
+    "fisico" (conducción/convección simple).
+  - RIESGO es tu impresión cualitativa, no un cálculo — Python la recalcula y tiene
+    prioridad si difieren. Usá "excede_temp_servicio" si la temperatura de la fuente ya
+    supera claramente la temperatura máxima de servicio del material; "excede_punto_fusion"
+    solo si es evidente que se derrite; si no ves riesgo claro, "ninguno".
+  - NOTA: nunca metas números ahí (temperaturas, energías, tiempos) — se ignoran igual,
+    y confunden si contradicen el cálculo real. Usala solo para una frase cualitativa.
 
-=== EJEMPLO ===
-entrada: contorno con 24 vértices distribuidos en anillo irregular alrededor de (0.50,0.50),
-área 0.045, perímetro 0.98
-TIPO: engranaje
-EJE: 0.50,0.50
+=== EJEMPLO 1 ===
+entrada: objeto chico de acero (espesor 0.02m), temp_ambiente=20°C, temp_fuente=850°C,
+tipo_proceso=fisico, temp_max_servicio=400°C
+MODELO: concentrado
+BIOT_ESTIMADO: bajo
+PROCESO: fisico
+RIESGO: excede_temp_servicio
+NOTA: la fuente supera la temperatura de servicio del acero, revisar exposición prolongada
+
+=== EJEMPLO 2 ===
+entrada: cámara de combustión H2/O2, temp_ambiente=20°C, temp_fuente=850°C,
+tipo_proceso=combustion_h2o2, temp_max_servicio=1200°C (piedra, ver skill materiales)
+MODELO: concentrado
+BIOT_ESTIMADO: bajo
+PROCESO: combustion
+RIESGO: ninguno
+NOTA: dentro de rango si el enfriamiento regenerativo funciona como está previsto
 """
 
 
-def _parsear_clasificacion(texto: str, centroide_defecto: tuple) -> dict:
-    resultado = {"tipo": "generico", "eje": centroide_defecto}
+def _parsear_respuesta_termica(texto: str) -> dict:
+    resultado = {
+        "modelo": "concentrado",
+        "biot_estimado": "bajo",
+        "proceso": "fisico",
+        "riesgo_llm": "ninguno",
+        "nota": "",
+    }
     if not texto:
         return resultado
-    import re
-    m_tipo = re.search(r"^TIPO\s*:\s*(\w+)", texto, re.MULTILINE)
-    if m_tipo and m_tipo.group(1).lower() in ("engranaje", "polea", "tornillo", "husillo", "generico"):
-        resultado["tipo"] = m_tipo.group(1).lower()
-    m_eje = re.search(r"^EJE\s*:\s*([\d.]+)\s*,\s*([\d.]+)", texto, re.MULTILINE)
-    if m_eje:
-        try:
-            resultado["eje"] = (float(m_eje.group(1)), float(m_eje.group(2)))
-        except ValueError:
-            pass
+
+    m = re.search(r"^MODELO\s*:\s*(\w+)", texto, re.MULTILINE)
+    if m and m.group(1).lower() in ("concentrado", "gradiente"):
+        resultado["modelo"] = m.group(1).lower()
+
+    m = re.search(r"^BIOT_ESTIMADO\s*:\s*(\w+)", texto, re.MULTILINE)
+    if m and m.group(1).lower() in ("bajo", "alto"):
+        resultado["biot_estimado"] = m.group(1).lower()
+
+    m = re.search(r"^PROCESO\s*:\s*(\w+)", texto, re.MULTILINE)
+    if m and m.group(1).lower() in ("fisico", "combustion"):
+        resultado["proceso"] = m.group(1).lower()
+
+    m = re.search(r"^RIESGO\s*:\s*(\w+)", texto, re.MULTILINE)
+    if m and m.group(1).lower() in ("ninguno", "excede_temp_servicio", "excede_punto_fusion"):
+        resultado["riesgo_llm"] = m.group(1).lower()
+
+    m = re.search(r"^NOTA\s*:\s*(.+)$", texto, re.MULTILINE)
+    if m:
+        # Se guarda tal cual para mostrar al usuario, pero NUNCA se usa como fuente
+        # numérica (ver validar_y_corregir_termico) — es solo texto cualitativo.
+        resultado["nota"] = m.group(1).strip()
+
     return resultado
 
 
-def clasificar_mecanismo(figura: dict, reporte: dict | None = None) -> dict:
-    """Solo tiene sentido llamarla cuando uso_destino == 'mecanismo'. Usa el
-    LLM únicamente para la etiqueta semántica; el centroide de respaldo
-    siempre sale del cálculo geométrico exacto (nunca del modelo)."""
-    reporte = reporte or auditar_geometria(figura, "mecanismo")
-    centroide_defecto = reporte["centroide"] or (0.5, 0.5)
-
-    if not reporte["contornos"]:
-        return {"tipo": "generico", "eje": centroide_defecto}
-
-    contorno = reporte["contornos"][0]
-    n_vertices = len(contorno["puntos"])
+def _decidir_criterio(geometria: dict, material: dict, condiciones: dict) -> dict:
     resumen = (
-        f"contorno con {n_vertices} vértices, "
-        f"área {abs(contorno['area']):.4f}, perímetro {contorno['perimetro']:.4f}, "
-        f"centroide ({centroide_defecto[0]:.2f},{centroide_defecto[1]:.2f})"
+        f'{{"geometria": {{"area_expuesta_m2": {geometria.get("area_expuesta_m2", 0):.5f}, '
+        f'"volumen_estimado_m3": {geometria.get("volumen_estimado_m3", 0):.6f}, '
+        f'"espesor_caracteristico_m": {geometria.get("espesor_caracteristico_m", 0):.5f}}}, '
+        f'"material": {{"conductividad_termica_w_mk": {material.get("conductividad_termica_w_mk", 0)}, '
+        f'"calor_especifico_j_kgk": {material.get("calor_especifico_j_kgk", 0)}, '
+        f'"densidad_kg_m3": {material.get("densidad_kg_m3", 0)}, '
+        f'"temperatura_max_servicio_c": {material.get("temperatura_max_servicio_c", "null")}}}, '
+        f'"condiciones": {{"temp_ambiente_c": {condiciones.get("temp_ambiente_c", 20)}, '
+        f'"temp_fuente_c": {condiciones.get("temp_fuente_c", 20)}, '
+        f'"tipo_proceso": "{condiciones.get("tipo_proceso", "fisico")}", '
+        f'"modo": "{condiciones.get("modo", "conduccion_transitoria")}"}}}}'
     )
-
-    texto = modelos.llamar(
-        "geometria",
+    texto = _llamar_modelo(
         messages=[
-            {"role": "system", "content": SYSTEM_CLASIFICAR_MECANISMO},
+            {"role": "system", "content": SYSTEM_TERMICO},
             {"role": "user", "content": f"entrada: {resumen}"},
         ],
+        num_predict=-1,
+        temperatura=TEMPERATURA_TERMICA,
     )
-    return _parsear_clasificacion(texto, centroide_defecto)
+    return _parsear_respuesta_termica(texto)
 
 
 # ---------------------------------------------------------------------------
-# API de conveniencia — pensada para llamar justo antes de exportar
+# Filtro de ruido (capa 3 — skill 00): Python es SIEMPRE la fuente numérica
 # ---------------------------------------------------------------------------
 
-def preparar_para_cad(figura: dict) -> dict:
-    """Todo lo que necesita cad2d.py para crear un BlockEntity a partir de
-    una figura ya generada: contornos normalizados + área/perímetro/centroide.
-    Devuelve None si la geometría no es apta (avisos ya impresos)."""
-    figura_ok, es_valida, advertencias = validar_y_corregir_geometria(figura, "mecanismo")
-    for a in advertencias:
-        print(f"[geometria]{a}")
-    if not es_valida:
-        return None
-    reporte = auditar_geometria(figura_ok, "mecanismo")
+def validar_y_corregir_termico(decision_llm: dict, calculo: dict) -> tuple[dict, bool, list[str]]:
+    """decision_llm: salida de _parsear_respuesta_termica().
+    calculo: resultado numérico ya calculado en Python (ver analizar_termico).
+    Devuelve (decision_final, es_valida, advertencias). Nunca es_valida=False
+    de forma bloqueante: esta skill es la que menos carga tiene en el LLM de
+    todo el pipeline, así que un desacuerdo se loguea pero no frena nada."""
+    advertencias: list[str] = []
+    resultado = dict(decision_llm)
+
+    riesgo_python = calculo["riesgo"]
+    if resultado["riesgo_llm"] != riesgo_python:
+        advertencias.append(
+            f"  RIESGO del modelo ('{resultado['riesgo_llm']}') no coincide con el cálculo "
+            f"Python ('{riesgo_python}') — se usa el de Python, es la fuente de verdad numérica."
+        )
+    resultado["riesgo"] = riesgo_python   # Python gana siempre
+
+    bi = calculo.get("biot")
+    if bi is not None:
+        biot_python = "bajo" if bi < 0.1 else "alto"
+        if resultado["biot_estimado"] != biot_python:
+            advertencias.append(
+                f"  BIOT_ESTIMADO del modelo ('{resultado['biot_estimado']}') no coincide con "
+                f"Bi={bi:.4f} calculado ('{biot_python}') — se usa el calculado."
+            )
+        resultado["biot_estimado"] = biot_python
+        resultado["modelo"] = "concentrado" if biot_python == "bajo" else "gradiente"
+
+    return resultado, True, advertencias
+
+
+# ---------------------------------------------------------------------------
+# API principal
+# ---------------------------------------------------------------------------
+
+def analizar_termico(geometria: dict, material: dict, condiciones: dict) -> dict:
+    """Punto de entrada de la skill. Todo dato numérico de salida es Python
+    puro; el LLM solo aportó el criterio (modelo/biot/proceso) y la nota.
+
+    geometria   : {"area_expuesta_m2", "volumen_estimado_m3", "espesor_caracteristico_m"}
+                  — normalmente sale de geometria_termica_desde_ficha().
+    material    : ficha de objetos.py (+ campos extendidos de la skill 03 si existen).
+    condiciones : {"temp_ambiente_c", "temp_fuente_c", "tipo_proceso", "modo",
+                   "coef_conveccion_w_m2k" (opcional), "masa_h2_kg" (opcional,
+                   solo si tipo_proceso es de combustión), "tiempo_s" (opcional)}
+
+    Devuelve:
+        {
+          "modelo": "concentrado"|"gradiente",
+          "biot": float,
+          "proceso": "fisico"|"combustion",
+          "temperatura_final_c": float,
+          "delta_temperatura_c": float,
+          "tiempo_estabilizacion_s": float | None,
+          "energia_liberada_j": float | None,      # solo si hubo combustión
+          "riesgo": "ninguno"|"excede_temp_servicio"|"excede_punto_fusion",
+          "nota": str,
+          "advertencias": [str, ...],
+        }
+    """
+    advertencias: list[str] = []
+    material = _sanear_material(material)
+
+    temp_amb, aviso = _sanear_temperatura_c(condiciones.get("temp_ambiente_c"), 20.0)
+    if aviso:
+        advertencias.append(aviso)
+    temp_fuente, aviso = _sanear_temperatura_c(condiciones.get("temp_fuente_c"), temp_amb)
+    if aviso:
+        advertencias.append(aviso)
+
+    h = condiciones.get("coef_conveccion_w_m2k") or H_CONVECCION_AIRE_LIBRE_W_M2K
+    area = geometria.get("area_expuesta_m2") or 0.01
+    espesor = geometria.get("espesor_caracteristico_m") or 0.01
+    volumen = geometria.get("volumen_estimado_m3") or 1e-6
+    masa_kg = volumen * material["densidad_kg_m3"]
+    k = material["conductividad_termica_w_mk"]
+    c = material["calor_especifico_j_kgk"]
+
+    biot = numero_biot(h, espesor, k)
+    tau = constante_tiempo_concentrado(masa_kg, c, h, area)
+
+    tipo_proceso = (condiciones.get("tipo_proceso") or "fisico").lower()
+    es_combustion = "combusti" in tipo_proceso or "h2" in tipo_proceso
+
+    energia_liberada_j = None
+    if es_combustion:
+        masa_h2_kg = condiciones.get("masa_h2_kg") or 0.0
+        if masa_h2_kg > 0:
+            energia_liberada_j = energia_combustion_h2_j(masa_h2_kg)
+            delta_t = delta_temperatura_combustion(energia_liberada_j, masa_kg, c)
+            temperatura_final_c = temp_amb + delta_t
+            tiempo_estabilizacion_s = None
+        else:
+            advertencias.append(
+                "  tipo_proceso de combustión sin 'masa_h2_kg' en condiciones — "
+                "no se puede calcular energía liberada; se usa temp_fuente_c como resultado."
+            )
+            temperatura_final_c = temp_fuente
+            delta_t = temp_fuente - temp_amb
+            tiempo_estabilizacion_s = None
+    else:
+        tiempo_s = condiciones.get("tiempo_s")
+        if tiempo_s is not None:
+            temperatura_final_c = temperatura_transitoria_concentrado(
+                temp_amb, temp_fuente, tiempo_s, tau
+            )
+        else:
+            # Sin tiempo explícito: reportar la temperatura de régimen (t->inf
+            # con esta convección simple tiende al ambiente; lo relevante acá
+            # es tau, que se devuelve para que quien llame decida cuánto esperar).
+            temperatura_final_c = temp_fuente
+        delta_t = temperatura_final_c - temp_amb
+        tiempo_estabilizacion_s = tau if tau != float("inf") else None
+
+    # RIESGO: SIEMPRE calculado en Python contra los datos reales de material.
+    temp_max_servicio = material.get("temperatura_max_servicio_c")
+    punto_fusion = material.get("punto_fusion_c")
+    riesgo = "ninguno"
+    if punto_fusion and temperatura_final_c >= punto_fusion:
+        riesgo = "excede_punto_fusion"
+    elif temp_max_servicio and temperatura_final_c >= temp_max_servicio:
+        riesgo = "excede_temp_servicio"
+
+    calculo = {"riesgo": riesgo, "biot": biot}
+
+    # ── LLM: solo criterio + nota cualitativa ──────────────────────────────
+    geometria_para_llm = {**geometria, "area_expuesta_m2": area,
+                           "volumen_estimado_m3": volumen, "espesor_caracteristico_m": espesor}
+    condiciones_para_llm = {**condiciones, "temp_ambiente_c": temp_amb, "temp_fuente_c": temp_fuente}
+    decision = _decidir_criterio(geometria_para_llm, material, condiciones_para_llm)
+    decision, _, adv_filtro = validar_y_corregir_termico(decision, calculo)
+    advertencias.extend(adv_filtro)
+
     return {
-        "contornos": contornos_para_exportar(figura_ok, "mecanismo"),
-        "area": reporte["area"],
-        "perimetro": reporte["perimetro"],
-        "centroide": reporte["centroide"],
+        "modelo": decision["modelo"],
+        "biot": biot,
+        "proceso": decision["proceso"],
+        "temperatura_final_c": temperatura_final_c,
+        "delta_temperatura_c": delta_t,
+        "tiempo_estabilizacion_s": tiempo_estabilizacion_s,
+        "energia_liberada_j": energia_liberada_j,
+        "riesgo": riesgo,
+        "nota": decision["nota"],
+        "advertencias": advertencias,
     }
-
-
-def preparar_para_cfd(figura: dict) -> dict | None:
-    """Contorno(s) listos para exportar_a_cfd() en simulador_aerodinamico.py.
-    Devuelve None si la geometría no es apta (avisos ya impresos)."""
-    figura_ok, es_valida, advertencias = validar_y_corregir_geometria(figura, "cfd")
-    for a in advertencias:
-        print(f"[geometria]{a}")
-    if not es_valida:
-        return None
-    return {"contornos": contornos_para_exportar(figura_ok, "cfd")}
 
 
 if __name__ == "__main__":
-    print("=== Cuadrado simple, cerrado y bien formado ===")
-    cuadrado = {
-        "puntos": [[0.4, 0.4], [0.6, 0.4], [0.6, 0.6], [0.4, 0.6]],
-        "conexiones": [[0, 1], [1, 2], [2, 3], [3, 0]],
-        "primitivas": [],
+    print("=== Caso físico: bloque de acero chico cerca de una fuente a 850°C ===")
+    geo = geometria_termica_desde_ficha(peso_kg=2.0, densidad_kg_m3=7850.0)
+    mat = {
+        "material": "acero",
+        "conductividad_termica_w_mk": 45.0,
+        "calor_especifico_j_kgk": 490.0,
+        "densidad_kg_m3": 7850.0,
+        "temperatura_max_servicio_c": 400.0,
+        "punto_fusion_c": 1450.0,
     }
-    r = auditar_geometria(cuadrado, "cfd")
-    print("cerrado:", r["cerrado"], "| área:", round(r["area"], 5),
-          "| perímetro:", round(r["perimetro"], 4), "| centroide:", r["centroide"],
-          "| apto:", r["apto_para_destino"])
+    cond = {"temp_ambiente_c": 20, "temp_fuente_c": 850, "tipo_proceso": "fisico",
+            "modo": "conduccion_transitoria", "tiempo_s": 120}
+    try:
+        r = analizar_termico(geo, mat, cond)
+        print("modelo:", r["modelo"], "| Bi:", round(r["biot"], 4),
+              "| T_final:", round(r["temperatura_final_c"], 1), "°C",
+              "| riesgo:", r["riesgo"])
+        for a in r["advertencias"]:
+            print(a)
+    except Exception as e:
+        print(f"(omitido, requiere Ollama corriendo: {e})")
 
-    print("\n=== Contorno abierto (falta la última conexión) ===")
-    abierto = {
-        "puntos": [[0.4, 0.4], [0.6, 0.4], [0.6, 0.6], [0.4, 0.601]],
-        "conexiones": [[0, 1], [1, 2], [2, 3]],
-        "primitivas": [],
-    }
-    fig_corr, valido, avisos = validar_y_corregir_geometria(abierto, "cfd")
-    print("válido:", valido, "| conexiones corregidas:", fig_corr["conexiones"])
-    for a in avisos:
-        print(a)
-
-    print("\n=== Figura en forma de 'ocho' (auto-intersección real) ===")
-    ocho = {
-        "puntos": [[0.3, 0.3], [0.7, 0.7], [0.7, 0.3], [0.3, 0.7]],
-        "conexiones": [[0, 1], [1, 2], [2, 3], [3, 0]],
-        "primitivas": [],
-    }
-    r2 = auditar_geometria(ocho, "cfd")
-    print("auto_interseccion:", r2["auto_interseccion"], "| cruces:", r2["cruces"],
-          "| apto:", r2["apto_para_destino"])
-
-    print("\n=== Exportar contorno normalizado ===")
-    contornos = contornos_para_exportar(cuadrado, "cfd", orientacion_deseada="positiva")
-    print("contornos listos para exportar:", contornos)
+    print("\n=== Caso combustión H2/O2 en cámara de piedra (sin LLM, solo cálculo) ===")
+    geo2 = geometria_termica_desde_ficha(peso_kg=0.5, densidad_kg_m3=2600.0)
+    q = energia_combustion_h2_j(masa_h2_kg=0.01)
+    dt = delta_temperatura_combustion(q, masa_objeto_kg=0.5, calor_especifico_j_kgk=900.0)
+    print(f"Energía liberada: {q/1e6:.2f} MJ | ΔT estimado: {dt:.1f} °C")
+    print(f"Masa de O2 estequiométrica para 0.01 kg de H2: {masa_o2_estequiometrica_kg(0.01):.4f} kg")

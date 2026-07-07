@@ -244,8 +244,6 @@ def renderizar_entorno(panel):
 # la GIL de Python hace que ambas operaciones sean atómicas, así que no necesitamos un Lock.
 _cola_figuras     = []   # (nombre, datos_figura, pedido_usuario, malla_info) — la figura ya se puede dibujar
 _cola_propiedades = []   # (nombre, propiedades)  — llegan después, en el paso 2
-_cola_mallas      = []   # (nombre, malla_json)   — malla_ia_async terminó en background, reemplaza la figura primitiva (PLAN_RECONSTRUCCION_MALLAS.md, sección 3, paso 3)
-
 
 # ---------------------------------------------------------------------------
 # Skill 01 (ubicación espacial) — detectar si la descripción trae un pedido
@@ -319,20 +317,10 @@ def _generar_y_encolar(descripcion, root, label_estado, lista_box):
                   f"'{nombre}' sin características (error en paso 2).")
         )
 
-    def al_terminar_malla(nombre, malla_json):
-        # malla_ia_async terminó en background (no hubo HIT de biblioteca al
-        # crear el objeto, así que se dibujó con el fallback LLM mientras
-        # tanto). Ahora sí hay una malla real -- se encola para que el hilo
-        # de OpenCV reemplace la geometría primitiva por la malla de verdad.
-        if malla_json:
-            _cola_mallas.append((nombre, malla_json))
-        en_hilo_ui(root, label_estado.config, text=f"Malla real de '{nombre}' lista.")
-
     registro = obj.crear_objeto(
         descripcion,
         callback_figura=al_dibujar,
         callback_propiedades=al_tener_propiedades,
-        callback_malla=al_terminar_malla,
     )
     if registro is None:
         en_hilo_ui(root, label_estado.config, text=f"No se pudo generar '{descripcion}'.")
@@ -981,15 +969,6 @@ while True:
 
     # Consumir mallas de IA que terminaron en background (sin HIT de biblioteca
     # al crear el objeto) y reemplazar la figura primitiva por la malla real.
-    while _cola_mallas:
-        nombre, malla_json = _cola_mallas.pop(0)
-        malla_lod_baja = malla_module.Malla.from_dict(malla_json["lod_bajo"])
-        malla_lod_alta = (malla_module.Malla.from_dict(malla_json["lod_alto"])
-                           if malla_json.get("lod_alto") else None)
-        entorno.actualizar_malla_de_figura(
-            nombre, malla_lod_baja, malla_lod_alta,
-            radio_bounding_relativo=malla_json.get("radio_bounding"),
-        )
 
     if landmarks_ef:
         etiquetas_handedness = []

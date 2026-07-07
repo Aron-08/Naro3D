@@ -170,6 +170,63 @@ def _generar_sync(pedido: str) -> "dict | None":
                 pass
 
 
+def generar_malla_normalizada_sincrona(pedido: str, radio_cm_objetivo: float = 30.0) -> "malla_mod.Malla | None":
+    """Punto de entrada usado por `objetos.py::generar_geometria_parametrica`
+    como fallback ESPECÍFICO para el caso 'factible: false' del kernel
+    paramétrico (ver horizonte "Reconectar TripoSR"): cuando el modelo de
+    composición dice honestamente que el objeto es una silueta orgánica
+    irregular (no una combinación razonable de caja/cilindro/esfera/...),
+    ese es el momento de invocar el pipeline generativo real en vez de
+    forzarlo a una caja genérica de 35cm.
+
+    A diferencia de `solicitar()` (pensada para disparar en background y
+    reemplazar una figura ya dibujada más tarde, vía callback), esta
+    función es SÍNCRONA/bloqueante: `generar_geometria_parametrica` ya es
+    una función bloqueante en sí misma (espera reintentos del LLM de
+    composición antes de devolver), así que bloquear acá también encaja
+    con el contrato existente — quien llama ya está esperando a que la
+    geometría esté lista antes de seguir.
+
+    Corre el mismo flujo completo que `solicitar()` (texto -> imagen
+    SD-Turbo -> malla TripoSR -> decimar -> archivar en biblioteca) vía
+    `_generar_sync`, y después RE-ESCALA el resultado para que quede en el
+    mismo espacio de centímetros reales que usa `ensamblador.py` — el
+    kernel paramétrico trabaja en cm reales (ver `malla.PX_POR_CM`),
+    mientras que la malla cruda de TripoSR sale en las unidades propias
+    del modelo (sin relación con cm). Como no hay forma de saber la escala
+    real del objeto a partir de la malla generada, se la normaliza a un
+    radio de bounding fijo (`radio_cm_objetivo`, default 30cm — del orden
+    de un objeto de escritorio mediano) en vez de asumir 1:1. Es una
+    aproximación de escala, igual de razonable que la que ya hace la caja
+    genérica de seguridad (35cm fijos) pero con la FORMA real del objeto en
+    vez de un cubo.
+
+    Devuelve `None` si las dependencias (torch/diffusers/TripoSR) no están
+    instaladas, si la generación falla, o si la malla resultante quedó
+    vacía — en todos esos casos, quien llama debe seguir con el siguiente
+    escalón de la red de seguridad (plantilla determinística / caja
+    genérica), nunca romper el pipeline."""
+    resultado = _generar_sync(pedido)
+    if resultado is None:
+        return None
+
+    try:
+        m = malla_mod.Malla.from_dict(resultado["lod_bajo"])
+    except (KeyError, TypeError, ValueError) as e:
+        print(f"[malla_ia_async] Resultado de TripoSR para '{pedido}' no tiene el formato "
+              f"esperado ({e}); se descarta.")
+        return None
+
+    radio = m.radio_bounding()
+    if m.num_vertices() == 0 or radio <= 0:
+        print(f"[malla_ia_async] Malla generada para '{pedido}' vacía o degenerada; se descarta.")
+        return None
+
+    factor = radio_cm_objetivo / radio
+    vertices_cm = [(x * factor, y * factor, z * factor) for x, y, z in m.vertices]
+    return malla_mod.Malla(vertices=vertices_cm, caras=m.caras)
+
+
 def solicitar(pedido: str, callback_terminado=None) -> None:
     """Encola la generación IA de `pedido` en un hilo daemon, sin bloquear
     a quien llama. `callback_terminado` (si se pasa) se invoca con

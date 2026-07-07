@@ -97,9 +97,17 @@ class EntornoVirtual:
     def distancia_camara(self):
         return self.camara.distancia_camara
 
-    # ------------------------------------------------------------------
-    # Agregar figuras — camino heredado (fallback LLM: puntos/primitivas)
-    # ------------------------------------------------------------------
+    # NUEVO: vision3d.py (proyector_fuera_de_eje) necesita centro_x/centro_y
+    # del mismo modo que ya necesitaba rotacion/distancia_camara — se
+    # delega a Camara, que es la fuente real de estos valores desde que
+    # camara.py se separó de esta clase.
+    @property
+    def centro_x(self):
+        return self.camara.centro_x
+
+    @property
+    def centro_y(self):
+        return self.camara.centro_y
 
     def agregar_figura(self, puntos_relativos, conexiones,
                        color_normal=(0,200,200), color_tocado=(0,0,255),

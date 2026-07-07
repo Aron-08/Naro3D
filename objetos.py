@@ -55,13 +55,19 @@ import electrico as elec    # ley de Ohm / red de componentes bajo demanda (skil
 import biblioteca_mallas as biblioteca   # fuente PRINCIPAL de geometría: HIT = Malla real sin pasar por el modelo
 import optimizacion_malla as opt         # mismo formato de serialización para la Malla de un HIT que para la del kernel paramétrico
 import ensamblador as ens                # kernel paramétrico (ver plan_kernel_parametrico.md) — 2do en prioridad, ya sin caída al pipeline viejo (Fase 6: robustecimiento)
+import malla_ia_async as malla_ia        # TripoSR (texto->imagen->malla) — fallback ESPECÍFICO para 'factible:false'
 from malla import PX_POR_CM              # único factor de escala cm -> unidades de escena (plan, sección 5.2)
-# NOTA: malla_ia_async (SD-Turbo + TripoSR) ya no se dispara desde acá. Antes
-# generaba una Malla real en background para reemplazar la geometría heredada
-# del fallback LLM de coordenadas; ese fallback ya no existe en el camino de
-# MISS de biblioteca (ver crear_objeto) porque el kernel paramétrico + su red
-# de seguridad determinística siempre producen una Malla real de una. El
-# módulo sigue disponible para quien quiera invocarlo manualmente.
+# NOTA (actualizada — ver horizonte "Reconectar TripoSR"): malla_ia_async ya
+# NO está completamente desconectado. Ya no se dispara para reemplazar en
+# background la geometría de un fallback de coordenadas (ese fallback no
+# existe más, ver crear_objeto), pero SÍ se invoca de forma síncrona y
+# puntual dentro de generar_geometria_parametrica() cuando el modelo de
+# composición dice honestamente 'factible: false' (silueta orgánica
+# irregular que ninguna combinación razonable de las primitivas del
+# catálogo puede aproximar) — ver generar_malla_normalizada_sincrona() en
+# malla_ia_async.py. Antes ese caso caía directo a la caja genérica de
+# 35cm, desperdiciando una capacidad generativa ya construida y probada.
+# El módulo sigue disponible también para invocación manual (solicitar()).
 
 
 # ---------------------------------------------------------------------------
@@ -612,14 +618,71 @@ def _figura_placeholder_desde_malla(radio_bounding: float) -> dict:
 # del plan.
 # ---------------------------------------------------------------------------
 
-MAX_INTENTOS_COMPOSICION = 3   # 1 normal + 2 reparaciones dirigidas, antes de la plantilla
+MAX_INTENTOS_COMPOSICION = 4   # 1 normal + reparaciones dirigidas (incluye la del agente de verificación), antes de la plantilla
 
 
-def _pedir_composicion(descripcion: str, temperatura: float | None = None) -> dict | None:
-    """Intento 1: pedido normal a la skill 'composicion_parametrica'."""
-    contenido = modelos.llamar("composicion_parametrica", user_content=descripcion,
-                                temperatura=temperatura)
-    return ia._extraer_json(contenido)
+def _generar_concepto(descripcion: str) -> str | None:
+    """Agente 1/3 ('concepto', skill 'composicion_concepto'): desglosa el
+    objeto en partes ESTRUCTURALES + cantidad + orientación, en lenguaje
+    llano, ANTES de pedirle a 'composicion_parametrica' que invente formas y
+    dimensiones. Mismo principio que ya usa el pipeline viejo (paso 0a antes
+    del paso 1 de ia_interprete.py): separar 'pensar qué partes tiene' de
+    'ponerle números', porque el modelo chico decide mejor cuando no hace
+    las dos cosas en la misma pasada. Nunca bloquea el pipeline: si el
+    modelo no responde, se sigue sin esta guía (igual que expandir_prompt)."""
+    texto = modelos.llamar("composicion_concepto", user_content=descripcion)
+    if not texto:
+        print("[objetos][paramétrico][concepto] El modelo no respondió; se sigue sin guía de concepto.")
+        return None
+    print(f"[objetos][paramétrico][concepto] Guía de partes:\n{texto}\n")
+    return texto.strip()
+
+
+def _verificar_composicion(descripcion: str, datos: dict) -> str | None:
+    """Agente 3/3 ('verificación', skill 'composicion_verificacion'): audita
+    semánticamente la composición ya generada y validada Pydantic-mente
+    (ruedas con eje vertical, piezas repetidas sin separar, cantidad de
+    ruedas rara) ANTES de darla por buena y ensamblarla. Devuelve None si
+    está OK, o el motivo puntual del problema (string) para reusar el mismo
+    mecanismo de reparación dirigida que ya existe para errores
+    estructurales. Nunca bloquea el pipeline: si el modelo no responde o
+    responde en un formato no reconocido, se interpreta como OK (esta
+    skill es una red de calidad extra, no una fuente de verdad — si falla,
+    el objeto igual sigue el camino normal de validación Pydantic + ensamble)."""
+    contenido_usuario = (
+        f"Descripción original: {descripcion}\n\n"
+        f"Composición generada:\n{json.dumps(datos, ensure_ascii=False)}"
+    )
+    texto = modelos.llamar("composicion_verificacion", user_content=contenido_usuario)
+    if not texto:
+        return None
+    texto = texto.strip()
+    if texto.upper().startswith("OK"):
+        return None
+    if "PROBLEMA" in texto.upper():
+        motivo = texto.split(":", 1)[1].strip() if ":" in texto else texto.strip()
+        print(f"[objetos][paramétrico][verificación] Problema detectado: {motivo}")
+        return motivo
+    return None   # formato no reconocido: no bloquear por una respuesta rara
+
+
+def _pedir_composicion(descripcion: str, temperatura: float | None = None,
+                        guia_concepto: str | None = None) -> dict | None:
+    """Intento 1: pedido normal a la skill 'composicion_parametrica'. Si hay
+    guía de concepto (agente 1), se le agrega como contexto — nunca se le
+    vuelve a pedir al modelo que piense de cero la lista de partes si ya la
+    pensó una vez (regla 4 del filtro de ruido, skill 00)."""
+    contenido = descripcion
+    if guia_concepto:
+        contenido = (
+            f"{descripcion}\n\n"
+            f"Guía de partes ya pensada (respetá esta lista de partes, cantidades y "
+            f"orientaciones — vos solo agregás forma exacta, dims_cm y contacto):\n"
+            f"{guia_concepto}"
+        )
+    contenido_llamado = modelos.llamar("composicion_parametrica", user_content=contenido,
+                                        temperatura=temperatura)
+    return ia._extraer_json(contenido_llamado)
 
 
 def _pedir_reparacion(datos_previos: dict, motivo_error: str) -> dict | None:
@@ -663,13 +726,22 @@ def generar_geometria_parametrica(descripcion: str) -> "tuple[object, float]":
     A diferencia de la versión inicial, esta función NUNCA devuelve None:
     agota una cadena de tareas de LLM específicas (composición normal ->
     reparación dirigida al error puntual -> segunda reparación) y, si todas
-    fallan, cae a una plantilla paramétrica determinística por palabra clave
-    (`ensamblador.buscar_plantilla_parametrica`, sin LLM) o, en última
-    instancia, a una caja genérica (`ensamblador.plantilla_generica_de_piso`).
-    Ninguno de esos dos últimos escalones es "el sistema anterior": son
-    parte del kernel paramétrico mismo (Partes -> resolver_ensamble), así
-    que el objeto siempre nace con contorno cerrado y contactos exactos por
-    construcción, nunca con coordenadas de escena escritas a mano por un LLM.
+    fallan:
+      - si el motivo final fue 'factible: false' (el modelo sostiene que el
+        objeto es una silueta orgánica/irregular), se intenta PRIMERO el
+        pipeline generativo TripoSR (`malla_ia_async.generar_malla_normalizada_
+        sincrona`) — ver horizonte "Reconectar TripoSR": es la herramienta
+        correcta para ese caso específico, no forzar 5-8 primitivas rígidas
+        a parecerse a una forma orgánica;
+      - si TripoSR no está disponible/falla, o el motivo final fue otro
+        (error estructural, JSON no parseable), cae a una plantilla
+        paramétrica determinística por palabra clave
+        (`ensamblador.buscar_plantilla_parametrica`, sin LLM) o, en última
+        instancia, a una caja genérica (`ensamblador.plantilla_generica_de_piso`).
+    Ninguno de esos escalones es "el sistema anterior": son parte del
+    kernel paramétrico mismo (Partes -> resolver_ensamble) o del pipeline
+    generativo ya existente en el proyecto — nunca coordenadas de escena
+    escritas a mano por un LLM.
 
     Devuelve siempre (malla_cm, radio_bounding_relativo).
     """
@@ -678,15 +750,22 @@ def generar_geometria_parametrica(descripcion: str) -> "tuple[object, float]":
     motivo_error = None
     tipo_error = None   # "sin_json" | "no_factible" | "estructural" — decide qué tarea de LLM usar en el siguiente intento
 
+    # Agente 1/3 ('concepto'): una sola vez, antes de cualquier intento —
+    # ver skill 'composicion_concepto' en modelos_config.json. Nunca se
+    # vuelve a pedir en los reintentos (regla 4 del filtro de ruido): si ya
+    # se pensó la lista de partes, los reintentos reparan el JSON puntual,
+    # no rehacen el concepto de cero.
+    guia_concepto = _generar_concepto(descripcion)
+
     for intento in range(1, MAX_INTENTOS_COMPOSICION + 1):
         if intento == 1:
             print(f"[objetos][paramétrico] Intento 1/{MAX_INTENTOS_COMPOSICION}: "
                   f"composición inicial para '{descripcion}'...")
-            datos = _pedir_composicion(descripcion)
+            datos = _pedir_composicion(descripcion, guia_concepto=guia_concepto)
         elif tipo_error == "sin_json":
             print(f"[objetos][paramétrico] Intento {intento}/{MAX_INTENTOS_COMPOSICION}: "
                   f"sin JSON previo, se reintenta la composición inicial (temp. baja)...")
-            datos = _pedir_composicion(descripcion, temperatura=0.1)
+            datos = _pedir_composicion(descripcion, temperatura=0.1, guia_concepto=guia_concepto)
         elif tipo_error == "no_factible":
             print(f"[objetos][paramétrico] Intento {intento}/{MAX_INTENTOS_COMPOSICION}: "
                   f"reintento reforzado (el modelo dijo 'no factible')...")
@@ -735,15 +814,65 @@ def generar_geometria_parametrica(descripcion: str) -> "tuple[object, float]":
             partes = None
             continue
 
+        # Agente 3/3 ('verificación', skill 'composicion_verificacion'):
+        # audita semánticamente la composición YA ensamblada con éxito
+        # (ruedas con eje vertical, piezas repetidas sin separar, cantidad
+        # de ruedas rara) antes de darla por buena. Si hay un problema
+        # concreto, se reusa el mismo mecanismo de reparación dirigida que
+        # ya existe para errores estructurales de Pydantic/ErrorEnsamble —
+        # nunca se descarta todo el intento a ciegas.
+        problema_verificacion = _verificar_composicion(descripcion, datos)
+        if problema_verificacion and intento < MAX_INTENTOS_COMPOSICION:
+            motivo_error = problema_verificacion
+            tipo_error = "estructural"
+            partes = None
+            continue
+
+        if problema_verificacion:
+            print(f"[objetos][paramétrico]   -> verificación encontró un problema pero se "
+                  f"agotaron los intentos ({problema_verificacion}); se usa igual (mejor esto "
+                  f"que caer a la plantilla genérica).")
+
         print(f"[objetos][paramétrico] ✓ Ensamble resuelto en el intento {intento}: "
               f"{len(partes)} partes, {malla_cm.num_vertices()} vértices, "
               f"{malla_cm.num_caras()} caras.")
         return _malla_a_radio_relativo(malla_cm)
 
-    # Se agotaron los intentos con LLM: red de seguridad determinística del
-    # KERNEL PARAMÉTRICO (no del pipeline viejo) — ver ensamblador.py.
+    # Se agotaron los intentos con LLM.
     print(f"[objetos][paramétrico] Se agotaron los {MAX_INTENTOS_COMPOSICION} intentos con LLM "
-          f"para '{descripcion}'; se usa la red de seguridad determinística del kernel paramétrico.")
+          f"para '{descripcion}' (último motivo: {motivo_error}).")
+
+    # Fallback ESPECÍFICO para 'factible: false' (ver horizonte "Reconectar
+    # TripoSR"): si el modelo dijo, de forma sostenida hasta agotar los
+    # reintentos, que el objeto NO es representable con el catálogo
+    # paramétrico (silueta orgánica/irregular — el motivo exacto para el
+    # que existe 'factible: false'), forzarlo a 5-8 primitivas rígidas
+    # produce una aproximación pobre a propósito. Este es precisamente el
+    # caso para el que ya existe un pipeline generativo real en el
+    # proyecto (texto -> imagen SD-Turbo -> malla TripoSR, con su propio
+    # lock de GPU pensado para 4GB) — invocarlo acá, de forma síncrona y
+    # puntual, en vez de caer directo a la caja genérica de 35cm.
+    if tipo_error == "no_factible":
+        print(f"[objetos][paramétrico] El motivo final fue 'no factible': se intenta el "
+              f"pipeline generativo TripoSR para '{descripcion}' antes de usar una plantilla "
+              f"rígida.")
+        try:
+            malla_ia_cm = malla_ia.generar_malla_normalizada_sincrona(descripcion)
+        except Exception as e:
+            print(f"[objetos][paramétrico][triposr] Falló la generación IA de malla: {e}")
+            malla_ia_cm = None
+
+        if malla_ia_cm is not None:
+            print(f"[objetos][paramétrico][triposr] ✓ Malla generada por TripoSR para "
+                  f"'{descripcion}' ({malla_ia_cm.num_vertices()} vértices, "
+                  f"{malla_ia_cm.num_caras()} caras) — se usa en vez de la plantilla rígida.")
+            return _malla_a_radio_relativo(malla_ia_cm)
+        print("[objetos][paramétrico][triposr] TripoSR no disponible o la generación falló "
+              "(dependencias faltantes, sin GPU, o error puntual); se cae a la red de "
+              "seguridad determinística del kernel paramétrico.")
+
+    # Red de seguridad determinística del KERNEL PARAMÉTRICO (no del
+    # pipeline viejo) — ver ensamblador.py. Último escalón, nunca falla.
     partes_plantilla = ens.buscar_plantilla_parametrica(descripcion)
     if partes_plantilla:
         print(f"[objetos][paramétrico] Plantilla determinística encontrada por palabra clave "
@@ -805,8 +934,8 @@ def _malla_a_radio_relativo(malla_cm) -> "tuple[object, float]":
     return malla_cm, radio_bounding_relativo
 
 
-def crear_objeto(descripcion: str, callback_figura=None, callback_propiedades=None,
-                  callback_malla=None) -> dict | None:
+def crear_objeto(descripcion: str, callback_figura=None, callback_propiedades=None) -> dict | None:
+
     """Crea un objeto completo del entorno: geometría, Malla real (si corresponde)
     y propiedades físicas, resueltas EN SECUENCIA, nunca al mismo tiempo.
 

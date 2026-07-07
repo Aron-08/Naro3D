@@ -1,0 +1,8 @@
+{
+  "camión": {
+    "embedding": [],
+    "ruta_json": "biblioteca_mallas\\camión.json",
+    "ruta_stl": "biblioteca_mallas\\camión.stl",
+    "origen": "parametrico_kernel"
+  }
+}

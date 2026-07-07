@@ -6,9 +6,10 @@ rojo/cian, y profundidad reforzada con sombra de contacto (la oclusión y el
 tamaño relativo ya son gratis: vienen del pintor's algorithm + la perspectiva
 que ya tiene entorno_virtual.py).
 
-MÓDULO DESCONECTADO: ningún otro archivo del proyecto lo importa todavía.
-No modifica ni necesita modificar entorno_virtual.py — ver el porqué y las
-instrucciones de conexión más abajo.
+Conectado desde main.py (teclas 'e' para anaglifo, 'p' para off-axis, ver
+renderizar_entorno()). No modifica entorno_virtual.py más allá de las
+properties de compatibilidad (centro_x/centro_y, rotacion, distancia_camara)
+que EntornoVirtual expone delegando a Camara
 
 -------------------------------------------------------------------------
 Por qué proyección fuera de eje y no la perspectiva simétrica que ya hay
@@ -330,17 +331,11 @@ def _render_ojo(entorno, proyector, ancho_panel_px, alto_panel_px, con_sombra=Tr
         for figura in figuras_ordenadas:
             _dibujar_sombra_contacto(panel, figura, proyector, alto_panel_px)
     for figura in figuras_ordenadas:
-        # Pintor's algorithm: al estar ordenadas de más lejos a más cerca,
-        # las cercanas se dibujan encima -> oclusión correcta gratis.
         figura.dibujar(panel, proyector)
-    # EntornoVirtual.dibujar() también dibuja la brújula de ejes (mismo
-    # método, no se reimplementa acá — es solo lectura, cero cambios en
-    # entorno_virtual.py). La brújula no pasa por `proyector`: usa
-    # entorno.rotacion directo y una posición de pantalla fija, así que
-    # dibujarla igual en cada ojo del anaglifo da el mismo píxel en ambos
-    # renders (sin fantasma rojo/cian) — es el resultado correcto para un
-    # HUD que no tiene paralaje propio.
-    entorno._dibujar_brujula(panel)
+    # CORREGIDO: EntornoVirtual ya no tiene _dibujar_brujula (vivía acá antes
+    # de que camara.py se separara). El método correcto es Camara.dibujar_brujula
+    # (sin guion bajo), accesible vía entorno.camara.
+    entorno.camara.dibujar_brujula(panel)
     return panel
 
 

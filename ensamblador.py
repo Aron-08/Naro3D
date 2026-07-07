@@ -43,7 +43,17 @@ except ImportError:
 # Catálogo cerrado de formas (ver plan, sección 4.2)
 # ---------------------------------------------------------------------------
 
-FORMAS_VALIDAS = {"caja", "cilindro", "esfera", "prisma_triangular", "tubo"}
+FORMAS_VALIDAS = {
+    "caja", "cilindro", "esfera", "prisma_triangular", "tubo",
+    # Extensión del catálogo (ver README_skills.md / horizonte "Expandir
+    # primitivas"): mismo principio de siempre — el LLM decide forma +
+    # dimensiones discretas, Python resuelve la geometría exacta. Ninguna
+    # de estas reintroduce el bug de coordenadas-por-texto: son fábricas
+    # nuevas en malla.py con la misma disciplina que las cinco originales.
+    "cono_truncado",   # generaliza cono perfecto (radio_tope=0) y frustum
+    "capsula",         # cilindro con casquetes semiesféricos
+    "prisma_n_lados",  # prisma regular de N caras (hexágono, octógono, ...)
+}
 
 # Claves obligatorias de dims_cm por forma — usado tanto para validar como
 # para armar mensajes de error útiles ("te faltó 'alto'").
@@ -53,6 +63,9 @@ _CLAVES_POR_FORMA = {
     "esfera": ("radio",),
     "prisma_triangular": ("ancho", "alto", "profundo"),
     "tubo": ("radio_externo", "radio_interno", "alto"),
+    "cono_truncado": ("radio_base", "radio_tope", "alto"),
+    "capsula": ("radio", "alto"),
+    "prisma_n_lados": ("radio", "alto", "lados"),
 }
 
 _LADOS_VALIDOS = {"izquierda", "derecha", "abajo", "arriba", "atras", "adelante"}
@@ -68,6 +81,11 @@ class ErrorEnsamble(Exception):
 # 4.1 — Parte: unidad de composición
 # ---------------------------------------------------------------------------
 
+_EJES_VALIDOS = {"x", "y", "z"}
+_FORMAS_ORIENTABLES = {"cilindro", "tubo", "cono_truncado", "capsula", "prisma_n_lados"}
+                                              # las que tienen un eje longitudinal propio
+
+
 @dataclass
 class Parte:
     nombre: str                     # "Asiento", "Pata_1" — único dentro del objeto
@@ -81,6 +99,20 @@ class Parte:
                                      # Una Parte con operacion="resta" DEBE tener
                                      # contacto="toca:...:<Objetivo>" (define dónde
                                      # se posiciona el hueco antes de restarlo).
+    orientacion_eje: str = "y"      # SOLO relevante para forma="cilindro"|"tubo": a lo
+                                     # largo de qué eje mundial queda el eje longitudinal
+                                     # de la pieza. "y" (default, comportamiento de
+                                     # siempre) = vertical, como una pata o un tronco.
+                                     # "x"/"z" = acostado — imprescindible para ruedas:
+                                     # una rueda real tiene el eje horizontal (el
+                                     # semieje), nunca vertical. Ver _aplicar_orientacion_eje.
+    offset_cm: tuple = (0.0, 0.0, 0.0)   # desplazamiento extra (dx,dy,dz) aplicado
+                                     # DESPUÉS de resolver `contacto`. `contacto` solo
+                                     # ancla UNA cara y centra las otras dos — sin esto
+                                     # es imposible poner, por ejemplo, 4 ruedas
+                                     # (delanteras + traseras) del mismo lado sin que
+                                     # las dos queden en la misma posición Z. Es la
+                                     # única forma de romper esa simetría por defecto.
     color: str | None = None
     notas: str = ""
 
@@ -107,6 +139,21 @@ class Parte:
                 f"no es un 'toca:...' — una resta necesita saber contra qué parte "
                 f"y en qué cara se posiciona el hueco antes de restarlo."
             )
+        if self.orientacion_eje not in _EJES_VALIDOS:
+            raise ErrorEnsamble(
+                f"Parte '{self.nombre}': orientacion_eje '{self.orientacion_eje}' inválida "
+                f"(debe ser 'x', 'y' o 'z')."
+            )
+        try:
+            self.offset_cm = tuple(float(v) for v in self.offset_cm)
+        except (TypeError, ValueError):
+            raise ErrorEnsamble(
+                f"Parte '{self.nombre}': offset_cm debe ser una tupla/lista de 3 números."
+            )
+        if len(self.offset_cm) != 3:
+            raise ErrorEnsamble(
+                f"Parte '{self.nombre}': offset_cm debe tener exactamente 3 componentes (dx,dy,dz)."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +169,21 @@ if _PYDANTIC_DISPONIBLE:
         dims_cm: dict
         contacto: str | None = None
         operacion: str = "union"
+        orientacion_eje: str = "y"
+        offset_cm: list[float] = [0.0, 0.0, 0.0]
+
+        @field_validator("offset_cm", mode="before")
+        @classmethod
+        def _offset_valido(cls, v):
+            if v is None:
+                return [0.0, 0.0, 0.0]
+            try:
+                salida = [float(x) for x in v]
+            except (TypeError, ValueError):
+                raise ValueError("offset_cm debe ser una lista de 3 números")
+            if len(salida) != 3:
+                raise ValueError("offset_cm debe tener exactamente 3 componentes (dx,dy,dz)")
+            return salida
 
         @field_validator("forma")
         @classmethod
@@ -135,6 +197,18 @@ if _PYDANTIC_DISPONIBLE:
         def _operacion_valida(cls, v):
             if v not in ("union", "resta"):
                 raise ValueError(f"operacion '{v}' inválida (debe ser 'union' o 'resta')")
+            return v
+
+        @field_validator("orientacion_eje", mode="before")
+        @classmethod
+        def _orientacion_valida(cls, v):
+            # El modelo local a veces omite el campo o manda null -> tratar
+            # como default "y" (vertical, comportamiento de siempre) en vez
+            # de romper toda la Parte por un campo nuevo y opcional.
+            if v is None or (isinstance(v, str) and v.strip() == ""):
+                return "y"
+            if v not in ("x", "y", "z"):
+                raise ValueError(f"orientacion_eje '{v}' inválida (debe ser 'x', 'y' o 'z')")
             return v
 
         @field_validator("dims_cm")
@@ -171,7 +245,9 @@ if _PYDANTIC_DISPONIBLE:
         try:
             return [
                 Parte(nombre=p.nombre, forma=p.forma, dims_cm=p.dims_cm,
-                      contacto=p.contacto, operacion=p.operacion)
+                      contacto=p.contacto, operacion=p.operacion,
+                      orientacion_eje=p.orientacion_eje,
+                      offset_cm=tuple(p.offset_cm))
                 for p in comp.partes
             ]
         except ErrorEnsamble:
@@ -185,18 +261,52 @@ else:
 # 6.1 — fabricar_malla: dispatcher forma -> fábrica de malla.py
 # ---------------------------------------------------------------------------
 
+# Permutación de ejes (x,y,z) -> nuevo (x,y,z) para reorientar una malla que
+# nace con su eje longitudinal en Y (cilindro/tubo, ver malla.py). Es una
+# reflexión (determinante -1): invierte el winding de las caras, pero eso no
+# afecta a render_malla.py (no hace backface culling, pinta por profundidad)
+# ni a las operaciones booleanas de trimesh (_malla_a_trimesh ya invierte si
+# el volumen da negativo). Sin esto, TODO cilindro/tubo del kernel queda
+# forzosamente vertical — que es exactamente el bug de "la rueda queda mal
+# puesta" (una rueda real tiene el eje horizontal, no vertical).
+_PERMUTACIONES_EJE = {
+    "y": (0, 1, 2),   # sin cambios — comportamiento de siempre, eje longitudinal en Y
+    "x": (1, 0, 2),   # intercambia X<->Y: el eje longitudinal queda acostado en X
+    "z": (0, 2, 1),   # intercambia Y<->Z: el eje longitudinal queda acostado en Z
+}
+
+
+def _aplicar_orientacion_eje(malla: Malla, eje: str) -> Malla:
+    if eje == "y":
+        return malla
+    perm = _PERMUTACIONES_EJE[eje]   # ya validado en Parte.__post_init__/ParteLLM
+    nuevos_vertices = [(v[perm[0]], v[perm[1]], v[perm[2]]) for v in malla.vertices]
+    return Malla(vertices=nuevos_vertices, caras=malla.caras)
+
+
 def fabricar_malla(parte: Parte) -> Malla:
     d = parte.dims_cm
     if parte.forma == "caja":
         return malla_mod.malla_cubo(d["ancho"], d["alto"], d["profundo"])
     if parte.forma == "cilindro":
-        return malla_mod.malla_cilindro(d["radio"], d["alto"])
+        malla = malla_mod.malla_cilindro(d["radio"], d["alto"])
+        return _aplicar_orientacion_eje(malla, parte.orientacion_eje)
     if parte.forma == "esfera":
         return malla_mod.malla_esfera(d["radio"])
     if parte.forma == "prisma_triangular":
         return malla_mod.malla_prisma_triangular(d["ancho"], d["alto"], d["profundo"])
     if parte.forma == "tubo":
-        return malla_mod.malla_tubo(d["radio_externo"], d["radio_interno"], d["alto"])
+        malla = malla_mod.malla_tubo(d["radio_externo"], d["radio_interno"], d["alto"])
+        return _aplicar_orientacion_eje(malla, parte.orientacion_eje)
+    if parte.forma == "cono_truncado":
+        malla = malla_mod.malla_cono_truncado(d["radio_base"], d["radio_tope"], d["alto"])
+        return _aplicar_orientacion_eje(malla, parte.orientacion_eje)
+    if parte.forma == "capsula":
+        malla = malla_mod.malla_capsula(d["radio"], d["alto"])
+        return _aplicar_orientacion_eje(malla, parte.orientacion_eje)
+    if parte.forma == "prisma_n_lados":
+        malla = malla_mod.malla_prisma_n_lados(d["radio"], d["alto"], d["lados"])
+        return _aplicar_orientacion_eje(malla, parte.orientacion_eje)
     raise ErrorEnsamble(f"Forma '{parte.forma}' sin fábrica asociada.")   # no debería pasar, Parte ya valida
 
 
@@ -395,6 +505,60 @@ def _restar_trimesh(malla_objetivo: Malla, centro_objetivo: tuple,
         return None
 
 
+def _trimesh_a_malla_publica(tm) -> Malla:
+    return _trimesh_a_malla(tm)
+
+
+def suavizar_malla_cm(malla: Malla, iteraciones: int = 1) -> Malla:
+    """Post-proceso COSMÉTICO opcional sobre la malla YA fusionada (ver
+    horizonte "Catmull-Clark para suavizado cosmético post-ensamble").
+
+    Importante — qué es y qué NO es esto:
+      - Los contactos entre partes (`_anclar_contacto`) ya se resolvieron de
+        forma EXACTA antes de llegar acá: las caras coinciden bit a bit.
+        Esto no se recalcula ni se "arregla" — se embellece la malla ya
+        correcta, no la sustituye por una aproximación.
+      - `trimesh` no expone Catmull-Clark verdadero (eso requiere una malla
+        de cuádriculas; `malla.py` produce siempre triángulos), así que se
+        usa subdivisión Loop (`trimesh.remesh.subdivide_loop`), que es la
+        subdivisión estándar para mallas triangulares y da el mismo efecto
+        perceptual (redondear aristas duras, suavizar la silueta) sin
+        cambiar de representación. Se documenta la diferencia de nombre a
+        propósito, para no prometer un algoritmo que no es el que corre.
+      - Es cosmético, no exacto: subdividir MUEVE ligeramente los vértices
+        de la superficie (incluidas las aristas de contacto entre partes).
+        Con 1-2 iteraciones el desplazamiento es sub-milimétrico a escala
+        de objeto y no se nota, pero por eso este post-proceso es opcional
+        (`iteraciones=0` por defecto en todo el pipeline) y nunca se aplica
+        antes de una operación booleana (`_aplicar_booleanas` ya corrió
+        antes de esto en `fusionar_ensamble`) — suavizar una malla y
+        restarle un hueco después daría una superficie de corte con la
+        forma sin suavizar, que se vería mal.
+
+    Si `trimesh` no está disponible o la subdivisión falla por cualquier
+    motivo, se devuelve `malla` intacta (mismo criterio de "nunca romper
+    el pipeline por un post-proceso opcional" que `_restar_trimesh`)."""
+    if iteraciones <= 0:
+        return malla
+    try:
+        import trimesh
+    except ImportError:
+        print("[ensamblador][suavizado] trimesh no disponible; se omite el suavizado cosmético.")
+        return malla
+    try:
+        tm = trimesh.Trimesh(vertices=malla.vertices, faces=malla.caras, process=True)
+        if hasattr(tm, "subdivide_loop"):
+            tm_suave = tm.subdivide_loop(iterations=iteraciones)
+        else:
+            from trimesh.remesh import subdivide_loop
+            v, f = subdivide_loop(tm.vertices, tm.faces, iterations=iteraciones)
+            tm_suave = trimesh.Trimesh(vertices=v, faces=f, process=True)
+        return _trimesh_a_malla_publica(tm_suave)
+    except Exception as e:
+        print(f"[ensamblador][suavizado] Subdivisión falló ({e}); se conserva la malla sin suavizar.")
+        return malla
+
+
 def _aplicar_booleanas(resultado: dict[str, tuple], partes: list[Parte]) -> dict[str, tuple]:
     """Post-procesa `resultado` (salida cruda del bucle de `resolver_ensamble`,
     con TODAS las partes, incluidas las de `operacion='resta'`) aplicando
@@ -481,6 +645,9 @@ def resolver_ensamble(partes: list[Parte]) -> dict[str, tuple[Malla, tuple]]:
         else:
             raise ErrorEnsamble(f"Contacto no reconocido: '{parte.contacto}'")
 
+        if parte.offset_cm != (0.0, 0.0, 0.0):
+            centro = tuple(centro[i] + parte.offset_cm[i] for i in range(3))
+
         resultado[parte.nombre] = (malla, centro)
 
     return _aplicar_booleanas(resultado, partes)
@@ -493,13 +660,19 @@ def resolver_ensamble(partes: list[Parte]) -> dict[str, tuple[Malla, tuple]]:
 # objeto termina con más triángulos que LOD_BAJO.
 # ---------------------------------------------------------------------------
 
-def fusionar_ensamble(resultado: dict[str, tuple[Malla, tuple]]) -> Malla:
+def fusionar_ensamble(resultado: dict[str, tuple[Malla, tuple]],
+                       suavizado_iteraciones: int = 0) -> Malla:
     """Combina todas las (malla, centro) de `resolver_ensamble()` en una
     sola Malla, con los vértices ya trasladados a su centro y toda la malla
     recentrada para que el origen quede en el centro de su propio bounding
     box (mismo criterio que `malla_desde_stl`, que resta el centroide del
     bbox del STL cargado) — así el objeto ensamblado se comporta como
-    cualquier otra Malla local del proyecto: centrada, sin transformar."""
+    cualquier otra Malla local del proyecto: centrada, sin transformar.
+
+    `suavizado_iteraciones` (default 0 = apagado): si es > 0, aplica
+    `suavizar_malla_cm` al final, DESPUÉS de fusionar y recentrar — nunca
+    antes de que los contactos exactos ya estén resueltos. Ver el docstring
+    de `suavizar_malla_cm` para las salvedades (es cosmético, no exacto)."""
     vertices: list[tuple] = []
     caras: list[tuple] = []
 
@@ -520,18 +693,24 @@ def fusionar_ensamble(resultado: dict[str, tuple[Malla, tuple]]) -> Malla:
     ccz = (min(zs) + max(zs)) / 2.0
 
     vertices_centrados = [(vx - ccx, vy - ccy, vz - ccz) for vx, vy, vz in vertices]
-    return Malla(vertices=vertices_centrados, caras=caras)
+    malla_final = Malla(vertices=vertices_centrados, caras=caras)
+    if suavizado_iteraciones > 0:
+        malla_final = suavizar_malla_cm(malla_final, suavizado_iteraciones)
+    return malla_final
 
 
-def ensamblar_partes(partes: list[Parte]) -> Malla:
+def ensamblar_partes(partes: list[Parte], suavizado_iteraciones: int = 0) -> Malla:
     """API de conveniencia: resuelve el ensamble completo y devuelve una
     única Malla fusionada en cm, centrada en el origen — lista para que
     `objetos.py::generar_geometria_parametrica` la escale a `radio_bounding`
     relativo (dividiendo por PX_POR_CM y por la escala de escena, ver
     plan sección 5.2) antes de pasarla a
-    EntornoVirtual.agregar_figura_desde_malla()."""
+    EntornoVirtual.agregar_figura_desde_malla().
+
+    `suavizado_iteraciones`: ver `fusionar_ensamble`/`suavizar_malla_cm` —
+    0 (default) mantiene el comportamiento exacto de siempre."""
     resultado = resolver_ensamble(partes)
-    return fusionar_ensamble(resultado)
+    return fusionar_ensamble(resultado, suavizado_iteraciones=suavizado_iteraciones)
 
 
 # ---------------------------------------------------------------------------
@@ -602,10 +781,28 @@ def _plantilla_puerta() -> list[Parte]:
 
 
 def _plantilla_auto() -> list[Parte]:
+    # Convención: ancho=eje X (izq/der), alto=eje Y (arriba/abajo), profundo=eje Z
+    # (frente/atrás). Las ruedas van con orientacion_eje="x" para que su eje
+    # (el semieje) quede horizontal y perpendicular al costado del auto —
+    # nunca vertical (ver _aplicar_orientacion_eje). "alto" del cilindro acá
+    # es el espesor de la rueda (cuánto sobresale del costado), no su diámetro.
+    # `contacto` solo puede anclar UN lado (acá: izquierda/derecha, pegado al
+    # costado de la carrocería) y centra los otros dos ejes — por eso las 4
+    # ruedas necesitan `offset_cm` para separarse en Z (adelante/atrás) y
+    # bajar en Y hasta el nivel del piso; sin esto las 4 quedarían apiladas
+    # en el mismo punto (el bug que se ve en la captura de pantalla).
     return [
-        Parte("Carroceria", "caja", {"ancho": 180, "alto": 50, "profundo": 90}),
-        Parte("Rueda_1", "cilindro", {"radio": 20, "alto": 15}, contacto="toca:abajo=arriba:Carroceria"),
-        Parte("Rueda_2", "cilindro", {"radio": 20, "alto": 15}, contacto="simetrica_a:Rueda_1"),
+        Parte("Carroceria", "caja", {"ancho": 170, "alto": 55, "profundo": 90}),
+        Parte("Cabina", "caja", {"ancho": 110, "alto": 35, "profundo": 80},
+              contacto="toca:abajo=arriba:Carroceria"),
+        Parte("Rueda_del_izq", "cilindro", {"radio": 28, "alto": 18}, orientacion_eje="x",
+              contacto="toca:derecha=izquierda:Carroceria", offset_cm=(0, -30, 28)),
+        Parte("Rueda_del_der", "cilindro", {"radio": 28, "alto": 18}, orientacion_eje="x",
+              contacto="simetrica_a:Rueda_del_izq"),
+        Parte("Rueda_tra_izq", "cilindro", {"radio": 28, "alto": 18}, orientacion_eje="x",
+              contacto="toca:derecha=izquierda:Carroceria", offset_cm=(0, -30, -28)),
+        Parte("Rueda_tra_der", "cilindro", {"radio": 28, "alto": 18}, orientacion_eje="x",
+              contacto="simetrica_a:Rueda_tra_izq"),
     ]
 
 
