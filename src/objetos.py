@@ -147,8 +147,9 @@ def _categoria_material_ext(nombre_material: str) -> str:
 # Persistencia en disco (objetos_db.json: { nombre: {figura, propiedades, ...} })
 # ---------------------------------------------------------------------------
 
-DB_PATH = "objetos_db.json"
+from pathlib import Path
 
+DB_PATH = str(Path(__file__).resolve().parent.parent / "data" / "objetos_db.json")
 
 def _cargar_db() -> dict:
     if not os.path.exists(DB_PATH):

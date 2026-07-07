@@ -115,7 +115,7 @@ def color_bgr_para_opencv(nombre: str) -> tuple:
 # objetos_db.json. Se indexa por el mismo nombre que usa objetos.py.
 # ---------------------------------------------------------------------------
 
-ESTILO_PATH = "editor_visual_estilos.json"
+ESTILO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "editor_visual_estilos.json")
 
 ESTILO_DEFECTO = {
     "color_hex": "#22D3EE",

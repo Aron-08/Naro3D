@@ -31,16 +31,17 @@ from geo_utils import segmentos_cruzan as _segmentos_se_cruzan  # test de cruce:
 # Caché en disco
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = "figuras_cache"
-os.makedirs(CACHE_DIR, exist_ok=True)
+_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
 
+CACHE_DIR = os.path.join(_DATA_DIR, "figuras_cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
 # Caché del paso -1 (expansor de prompt, ver más abajo) — carpeta separada a
 # propósito (mismo criterio que el resto del proyecto: "cachear por skill",
 # nunca todo junto) porque acá se cachea un TEXTO de guía de técnica de
 # dibujo, no una figura ya resuelta; si en algún momento se quiere invalidar
 # solo los prompts expandidos (ej. se mejoró SYSTEM_EXPANSOR_PROMPT) sin
 # perder las figuras ya generadas, alcanza con borrar esta carpeta sola.
-PROMPT_CACHE_DIR = "prompts_expandidos_cache"
+PROMPT_CACHE_DIR = os.path.join(_DATA_DIR, "prompts_expandidos_cache")
 os.makedirs(PROMPT_CACHE_DIR, exist_ok=True)
 
 

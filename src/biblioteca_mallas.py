@@ -36,7 +36,7 @@ import modelos
 import optimizacion_malla as opt
 from malla import Malla
 
-CARPETA_BIBLIOTECA = "biblioteca_mallas"
+CARPETA_BIBLIOTECA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "biblioteca_mallas")
 RUTA_INDICE = os.path.join(CARPETA_BIBLIOTECA, "_indice.json")
 
 UMBRAL_DEFAULT = 0.75
