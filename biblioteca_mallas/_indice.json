@@ -4,5 +4,23 @@
     "ruta_json": "biblioteca_mallas\\camión.json",
     "ruta_stl": "biblioteca_mallas\\camión.stl",
     "origen": "parametrico_kernel"
+  },
+  "auto": {
+    "embedding": [],
+    "ruta_json": "biblioteca_mallas\\auto.json",
+    "ruta_stl": "biblioteca_mallas\\auto.stl",
+    "origen": "parametrico_kernel"
+  },
+  "avión": {
+    "embedding": [],
+    "ruta_json": "biblioteca_mallas\\avión.json",
+    "ruta_stl": "biblioteca_mallas\\avión.stl",
+    "origen": "parametrico_kernel"
+  },
+  "automovil": {
+    "embedding": [],
+    "ruta_json": "biblioteca_mallas\\automovil.json",
+    "ruta_stl": "biblioteca_mallas\\automovil.stl",
+    "origen": "parametrico_kernel"
   }
 }

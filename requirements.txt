@@ -1,0 +1,70 @@
+# ==============================================================================
+# Naro Studio — Dependencias de Python
+#
+# Instalación estándar:
+#     pip install -r requirements.txt
+#
+# En Linux, pydantic/numpy pueden requerir la bandera --break-system-packages
+# según cómo esté gestionado el Python del sistema:
+#     pip install -r requirements.txt --break-system-packages
+#
+# Las dependencias opcionales (fallback generativo TripoSR/SD-Turbo e
+# integración con la API de Claude) están al final de este archivo,
+# comentadas — ver las secciones correspondientes más abajo antes de
+# descomentarlas.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Núcleo: visión por computadora, geometría, cliente de Ollama
+# ------------------------------------------------------------------------------
+opencv-python>=4.9.0
+numpy>=1.26.0
+mediapipe>=0.10.9
+ollama>=0.1.7
+
+# ------------------------------------------------------------------------------
+# Geometría 3D: decimación de mallas, operaciones booleanas, validación
+# ------------------------------------------------------------------------------
+trimesh>=4.0.0
+pyfqmr>=0.2.0
+manifold3d>=2.2.0
+
+# ------------------------------------------------------------------------------
+# Validación estricta de la salida JSON del LLM (kernel paramétrico,
+# ficha extendida de materiales)
+# ------------------------------------------------------------------------------
+pydantic>=2.5.0
+
+# ==============================================================================
+# Dependencias de desarrollo / testing
+# ==============================================================================
+pytest>=7.4.0
+
+# ==============================================================================
+# OPCIONAL — Fallback generativo de malla (texto -> imagen -> malla 3D)
+# Requiere GPU con CUDA. Sin esto, el proyecto sigue funcionando normalmente:
+# cae a la red de seguridad determinística (plantillas paramétricas o caja
+# genérica) en vez de generar la malla orgánica.
+#
+# Descomentar e instalar con:
+#     pip install -r requirements.txt --break-system-packages
+#
+# Además de estos paquetes de PyPI, hace falta clonar e instalar TripoSR a
+# mano (no está publicado en PyPI):
+#     git clone https://github.com/VAST-AI-Research/TripoSR
+#     pip install -e TripoSR --break-system-packages
+# ==============================================================================
+# torch>=2.1.0
+# diffusers>=0.25.0
+# transformers>=4.36.0
+# accelerate>=0.25.0
+
+# ==============================================================================
+# OPCIONAL — Integración con la API de Claude (Anthropic)
+# Ver modelos_api_claude.py y NOTA_integracion_claude_api.md.
+# Estado: documentado pero NO verificado contra la API real (ver README).
+#
+# Descomentar y configurar la variable de entorno ANTHROPIC_API_KEY antes
+# de activar el backend "claude" en modelos_config.json.
+# ==============================================================================
+# anthropic>=0.25.0
